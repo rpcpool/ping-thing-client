@@ -42,6 +42,7 @@ const VA_API_KEY = process.env.VA_API_KEY;
 const VERBOSE_LOG = process.env.VERBOSE_LOG === "true" ? true : false;
 const COMMITMENT_LEVEL = process.env.COMMITMENT || "confirmed";
 const USE_PRIORITY_FEE = process.env.USE_PRIORITY_FEE == "true" ? true : false;
+const ORIGIN_HEADER = process.env.ORIGIN_HEADER || null;
 
 const TX_RETRY_INTERVAL = 2000;
 
@@ -51,10 +52,12 @@ if (VERBOSE_LOG) console.log(`${new Date().toISOString()} Starting script`);
 // const walletAccount = new web3.PublicKey(USER_KEYPAIR.publicKey);
 const connection = new web3.Connection(RPC_ENDPOINT, {
   commitment: COMMITMENT_LEVEL,
+  httpHeaders: ORIGIN_HEADER ? { origin: ORIGIN_HEADER } : undefined,
 });
 
 const connectionWs = new web3.Connection(RPC_ENDPOINT, {
   wsEndpoint: WS_ENDPOINT,
+  httpHeaders: ORIGIN_HEADER ? { origin: ORIGIN_HEADER } : undefined,
 });
 
 const gBlockhash = { value: null, updated_at: 0 };
