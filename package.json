@@ -13,8 +13,6 @@
     "@solana-program/compute-budget": "^0.5.0",
     "@solana-program/system": "^0.5.0",
     "@solana/promises": "2.0.0-canary-20240808085236",
-    "@solana/signers": "2.0.0-canary-20240808085236",
-    "@solana/transaction-confirmation": "2.0.0-canary-20240808085236",
     "@solana/web3.js": "2.0.0-canary-20240808085236",
     "axios": "^1.7.3",
     "bs58": "^6.0.0",
