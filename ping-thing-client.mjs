@@ -4,7 +4,6 @@ import {
   setTransactionMessageFeePayer,
   setTransactionMessageLifetimeUsingBlockhash,
   createKeyPairFromBytes,
-  getAddressFromPublicKey,
   createSignerFromKeyPair,
   signTransaction,
   appendTransactionMessageInstructions,
@@ -66,7 +65,6 @@ async function pingThing() {
   const MAX_TRIES = 3;
   let tryCount = 0;
 
-  const feePayer = await getAddressFromPublicKey(USER_KEYPAIR.publicKey);
   const signer = await createSignerFromKeyPair(USER_KEYPAIR);
 
   while (true) {
@@ -83,7 +81,7 @@ async function pingThing() {
         const latestBlockhash = await getLatestBlockhash();
         const transaction = pipe(
           createTransactionMessage({ version: 0 }),
-          (tx) => setTransactionMessageFeePayer(feePayer, tx),
+          (tx) => setTransactionMessageFeePayer(signer.address, tx),
           (tx) =>
             setTransactionMessageLifetimeUsingBlockhash(
               latestBlockhash,
@@ -97,7 +95,7 @@ async function pingThing() {
                 }),
                 getTransferSolInstruction({
                   source: signer,
-                  destination: feePayer,
+                  destination: signer.address,
                   amount: 5000,
                 }),
               ],
