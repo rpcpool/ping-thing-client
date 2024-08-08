@@ -21,7 +21,7 @@ import { getSetComputeUnitLimitInstruction } from "@solana-program/compute-budge
 import { getTransferSolInstruction } from "@solana-program/system";
 import { createRecentSignatureConfirmationPromiseFactory } from "@solana/transaction-confirmation";
 import { sleep } from "./utils/misc.mjs";
-import { watchBlockhash } from "./utils/blockhash.mjs";
+import { getLatestBlockhash } from "./utils/blockhash.mjs";
 import { rpc, rpcSubscriptions } from "./utils/rpc.mjs";
 import { watchSlotSent } from "./utils/slot.mjs";
 import { setMaxListeners } from "events";
@@ -54,8 +54,6 @@ if (VERBOSE_LOG) console.log(`Starting script`);
 let USER_KEYPAIR;
 const TX_RETRY_INTERVAL = 2000;
 
-const gBlockhash = { value: null, updated_at: 0, lastValidBlockHeight: 0 };
-
 // Record new slot on `firstShredReceived`
 const gSlotSent = { value: null, updated_at: 0 };
 async function pingThing() {
@@ -76,8 +74,6 @@ async function pingThing() {
   while (true) {
     await sleep(SLEEP_MS_LOOP);
 
-    let blockhash;
-    let lastValidBlockHeight;
     let slotSent;
     let slotLanded;
     let signature;
@@ -86,12 +82,7 @@ async function pingThing() {
 
     // Wait fresh data
     while (true) {
-      if (
-        Date.now() - gBlockhash.updated_at < 10000 &&
-        Date.now() - gSlotSent.updated_at < 50
-      ) {
-        blockhash = gBlockhash.value;
-        lastValidBlockHeight = gBlockhash.lastValidBlockHeight;
+      if (Date.now() - gSlotSent.updated_at < 50) {
         slotSent = gSlotSent.value;
         break;
       }
@@ -100,15 +91,13 @@ async function pingThing() {
     }
     try {
       try {
+        const latestBlockhash = await getLatestBlockhash();
         const transaction = pipe(
           createTransactionMessage({ version: 0 }),
           (tx) => setTransactionMessageFeePayer(feePayer, tx),
           (tx) =>
             setTransactionMessageLifetimeUsingBlockhash(
-              {
-                blockhash: gBlockhash.value,
-                lastValidBlockHeight: gBlockhash.lastValidBlockHeight,
-              },
+              latestBlockhash,
               tx
             ),
           (tx) =>
@@ -286,7 +275,6 @@ async function pingThing() {
 }
 
 await Promise.all([
-  watchBlockhash(gBlockhash),
   watchSlotSent(gSlotSent),
   pingThing(),
 ]);
