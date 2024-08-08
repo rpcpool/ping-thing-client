@@ -23,7 +23,7 @@ import { createRecentSignatureConfirmationPromiseFactory } from "@solana/transac
 import { sleep } from "./utils/misc.mjs";
 import { getLatestBlockhash } from "./utils/blockhash.mjs";
 import { rpc, rpcSubscriptions } from "./utils/rpc.mjs";
-import { watchSlotSent } from "./utils/slot.mjs";
+import { getNextSlot } from "./utils/slot.mjs";
 import { setMaxListeners } from "events";
 import axios from "axios";
 
@@ -54,8 +54,6 @@ if (VERBOSE_LOG) console.log(`Starting script`);
 let USER_KEYPAIR;
 const TX_RETRY_INTERVAL = 2000;
 
-// Record new slot on `firstShredReceived`
-const gSlotSent = { value: null, updated_at: 0 };
 async function pingThing() {
   USER_KEYPAIR = await createKeyPairFromBytes(
     bs58.decode(process.env.WALLET_PRIVATE_KEYPAIR)
@@ -80,15 +78,6 @@ async function pingThing() {
     let txStart;
     let txSendAttempts = 1;
 
-    // Wait fresh data
-    while (true) {
-      if (Date.now() - gSlotSent.updated_at < 50) {
-        slotSent = gSlotSent.value;
-        break;
-      }
-
-      await sleep(1);
-    }
     try {
       try {
         const latestBlockhash = await getLatestBlockhash();
@@ -135,21 +124,20 @@ async function pingThing() {
             rpcSubscriptions,
           });
         setMaxListeners(100);
-        const abortController = new AbortController();
 
         while (true) {
           try {
+            slotSent = await getNextSlot();
             await mSendTransaction(transactionSignedWithFeePayer, {
               commitment: "confirmed",
               maxRetries: 0n,
               skipPreflight: true,
-            });
+            })
 
             await Promise.race([
               getRecentSignatureConfirmationPromise({
                 signature,
                 commitment: "confirmed",
-                abortSignal: abortController.signal,
               }),
               sleep(TX_RETRY_INTERVAL * txSendAttempts).then(() => {
                 throw new Error("Tx Send Timeout");
@@ -274,7 +262,4 @@ async function pingThing() {
   }
 }
 
-await Promise.all([
-  watchSlotSent(gSlotSent),
-  pingThing(),
-]);
+await pingThing();
