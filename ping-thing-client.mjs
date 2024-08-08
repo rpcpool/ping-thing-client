@@ -1,30 +1,27 @@
+import { safeRace } from "@solana/promises";
 import {
-  createDefaultRpcTransport,
   createTransactionMessage,
   pipe,
-  setTransactionMessageFeePayer,
+  setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
   createKeyPairFromBytes,
-  getAddressFromPublicKey,
   createSignerFromKeyPair,
-  signTransaction,
   appendTransactionMessageInstructions,
-  sendTransactionWithoutConfirmingFactory,
-  createSolanaRpcSubscriptions_UNSTABLE,
+  signTransactionMessageWithSigners,
+  SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
+  isSolanaError,
   getSignatureFromTransaction,
-  compileTransaction,
-  createSolanaRpc,
-  SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND
+  sendAndConfirmTransactionFactory,
   // Address,
 } from "@solana/web3.js";
 import dotenv from "dotenv";
 import bs58 from "bs58";
 import { getSetComputeUnitLimitInstruction } from "@solana-program/compute-budget";
 import { getTransferSolInstruction } from "@solana-program/system";
-import { createRecentSignatureConfirmationPromiseFactory } from "@solana/transaction-confirmation";
-import { sleep } from "./utils/misc.mjs";
-import { watchBlockhash } from "./utils/blockhash.mjs";
-import { watchSlotSent } from "./utils/slot.mjs";
+import { sleep, timeout } from "./utils/misc.mjs";
+import { getLatestBlockhash } from "./utils/blockhash.mjs";
+import { rpc, rpcSubscriptions } from "./utils/rpc.mjs";
+import { getNextSlot } from "./utils/slot.mjs";
 import { setMaxListeners } from "events";
 import axios from "axios";
 
@@ -42,10 +39,6 @@ process.on("SIGINT", function () {
   process.exit();
 });
 
-
-const RPC_ENDPOINT = process.env.RPC_ENDPOINT;
-const WS_ENDPOINT = process.env.WS_ENDPOINT;
-
 const SLEEP_MS_RPC = process.env.SLEEP_MS_RPC || 2000;
 const SLEEP_MS_LOOP = process.env.SLEEP_MS_LOOP || 0;
 const VA_API_KEY = process.env.VA_API_KEY;
@@ -56,19 +49,16 @@ const SKIP_VALIDATORS_APP = process.env.SKIP_VALIDATORS_APP || false;
 
 if (VERBOSE_LOG) console.log(`Starting script`);
 
-const connection = createSolanaRpc(RPC_ENDPOINT)
-
-const rpcSubscriptions = createSolanaRpcSubscriptions_UNSTABLE(
-  WS_ENDPOINT
-);
-
 let USER_KEYPAIR;
 const TX_RETRY_INTERVAL = 2000;
 
-const gBlockhash = { value: null, updated_at: 0, lastValidBlockHeight: 0 };
+setMaxListeners(100);
 
-// Record new slot on `firstShredReceived`
-const gSlotSent = { value: null, updated_at: 0 };
+const mSendAndConfirmTransaction = sendAndConfirmTransactionFactory({
+  rpc,
+  rpcSubscriptions,
+});
+
 async function pingThing() {
   USER_KEYPAIR = await createKeyPairFromBytes(
     bs58.decode(process.env.WALLET_PRIVATE_KEYPAIR)
@@ -81,112 +71,73 @@ async function pingThing() {
   const MAX_TRIES = 3;
   let tryCount = 0;
 
-  const feePayer = await getAddressFromPublicKey(USER_KEYPAIR.publicKey);
   const signer = await createSignerFromKeyPair(USER_KEYPAIR);
-
+  const BASE_TRANSACTION_MESSAGE = pipe(
+    createTransactionMessage({ version: 0 }),
+    (tx) => setTransactionMessageFeePayerSigner(signer, tx),
+    (tx) =>
+      appendTransactionMessageInstructions(
+        [
+          getSetComputeUnitLimitInstruction({
+            units: 500,
+          }),
+          getTransferSolInstruction({
+            source: signer,
+            destination: signer.address,
+            amount: 5000,
+          }),
+        ],
+        tx
+      )
+  );
   while (true) {
     await sleep(SLEEP_MS_LOOP);
 
-    let blockhash;
-    let lastValidBlockHeight;
     let slotSent;
     let slotLanded;
     let signature;
     let txStart;
     let txSendAttempts = 1;
 
-    // Wait fresh data
-    while (true) {
-      if (
-        Date.now() - gBlockhash.updated_at < 10000 &&
-        Date.now() - gSlotSent.updated_at < 50
-      ) {
-        blockhash = gBlockhash.value;
-        lastValidBlockHeight = gBlockhash.lastValidBlockHeight;
-        slotSent = gSlotSent.value;
-        break;
-      }
-
-      await sleep(1);
-    }
     try {
       try {
-        const transaction = pipe(
-          createTransactionMessage({ version: 0 }),
-          (tx) => setTransactionMessageFeePayer(feePayer, tx),
-          (tx) =>
-            setTransactionMessageLifetimeUsingBlockhash(
-              {
-                blockhash: gBlockhash.value,
-                lastValidBlockHeight: gBlockhash.lastValidBlockHeight,
-              },
-              tx
-            ),
-          (tx) =>
-            appendTransactionMessageInstructions(
-              [
-                getSetComputeUnitLimitInstruction({
-                  units: 500,
-                }),
-                getTransferSolInstruction({
-                  source: signer,
-                  destination: feePayer,
-                  amount: 5000,
-                }),
-              ],
-              tx
-            )
+        const latestBlockhash = await getLatestBlockhash();
+        const transactionMessage = setTransactionMessageLifetimeUsingBlockhash(
+          latestBlockhash,
+          BASE_TRANSACTION_MESSAGE
         );
-        const transactionSignedWithFeePayer = await signTransaction(
-          [USER_KEYPAIR],
-          compileTransaction(transaction)
-        );
+        const transactionSignedWithFeePayer =
+          await signTransactionMessageWithSigners(transactionMessage);
         signature = getSignatureFromTransaction(transactionSignedWithFeePayer);
 
         txStart = Date.now();
 
         console.log(`Sending ${signature}`);
 
-        const mSendTransaction = sendTransactionWithoutConfirmingFactory({
-          rpc: connection,
-        });
-
-        const getRecentSignatureConfirmationPromise =
-          createRecentSignatureConfirmationPromiseFactory({
-            rpc: connection,
-            rpcSubscriptions,
-          });
-        setMaxListeners(100);
-        const abortController = new AbortController();
-
+        slotSent = await getNextSlot();
         while (true) {
           try {
-            await mSendTransaction(transactionSignedWithFeePayer, {
-              commitment: "confirmed",
-              maxRetries: 0n,
-              skipPreflight: true,
-            });
-
-            await Promise.race([
-              getRecentSignatureConfirmationPromise({
-                signature,
+            await safeRace([
+              mSendAndConfirmTransaction(transactionSignedWithFeePayer, {
                 commitment: "confirmed",
-                abortSignal: abortController.signal,
+                maxRetries: 0n,
+                skipPreflight: true,
               }),
-              sleep(TX_RETRY_INTERVAL * txSendAttempts).then(() => {
-                throw new Error("Tx Send Timeout");
-              }),
+              timeout(TX_RETRY_INTERVAL * txSendAttempts),
             ]);
 
             console.log(`Confirmed tx ${signature}`);
 
             break;
           } catch (e) {
-            console.log(
-              `Tx not confirmed after ${
-                TX_RETRY_INTERVAL * txSendAttempts++
-              }ms, resending`
-            );
+            if (e.message === "Timeout") {
+              console.log(
+                `Tx not confirmed after ${TX_RETRY_INTERVAL * txSendAttempts++
+                }ms, resending`
+              );
+            } else {
+              throw e;
+            }
           }
         }
       } catch (e) {
@@ -220,7 +171,7 @@ async function pingThing() {
       await sleep(SLEEP_MS_RPC);
       if (signature !== FAKE_SIGNATURE) {
         // Capture the slotLanded
-        let txLanded = await connection
+        let txLanded = await rpc
           .getTransaction(signature, {
             commitment: COMMITMENT_LEVEL,
             maxSupportedTransactionVersion: 255,
@@ -296,8 +247,4 @@ async function pingThing() {
   }
 }
 
-await Promise.all([
-  watchBlockhash(gBlockhash, connection),
-  watchSlotSent(gSlotSent, rpcSubscriptions),
-  pingThing(),
-]);
+await pingThing();
