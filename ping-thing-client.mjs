@@ -1,17 +1,16 @@
 import {
   createTransactionMessage,
   pipe,
-  setTransactionMessageFeePayer,
+  setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
   createKeyPairFromBytes,
   createSignerFromKeyPair,
-  signTransaction,
   appendTransactionMessageInstructions,
   sendTransactionWithoutConfirmingFactory,
-  getSignatureFromTransaction,
-  compileTransaction,
+  signTransactionMessageWithSigners,
   SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
   isSolanaError,
+  getSignatureFromTransaction,
   // Address,
 } from "@solana/web3.js";
 import dotenv from "dotenv";
@@ -68,7 +67,7 @@ async function pingThing() {
   const signer = await createSignerFromKeyPair(USER_KEYPAIR);
   const BASE_TRANSACTION_MESSAGE = pipe(
     createTransactionMessage({ version: 0 }),
-    (tx) => setTransactionMessageFeePayer(signer.address, tx),
+    (tx) => setTransactionMessageFeePayerSigner(signer, tx),
     (tx) =>
       appendTransactionMessageInstructions(
         [
@@ -100,10 +99,8 @@ async function pingThing() {
           latestBlockhash,
           BASE_TRANSACTION_MESSAGE
         );
-        const transactionSignedWithFeePayer = await signTransaction(
-          [USER_KEYPAIR],
-          compileTransaction(transactionMessage)
-        );
+        const transactionSignedWithFeePayer =
+          await signTransactionMessageWithSigners(transactionMessage);
         signature = getSignatureFromTransaction(transactionSignedWithFeePayer);
 
         txStart = Date.now();
