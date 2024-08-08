@@ -1,45 +1,45 @@
-import { sleep } from "./misc.mjs";
+import { createCipheriv } from "crypto";
 import { rpcSubscriptions } from "./rpc.mjs";
 
 const MAX_SLOT_FETCH_ATTEMPTS = process.env.MAX_SLOT_FETCH_ATTEMPTS || 100;
-let attempts = 0;
-const abortController = new AbortController();
 
-export const watchSlotSent = async (gSlotSent) => {
-  try {
-    const slotNotifications = await rpcSubscriptions
-      .slotsUpdatesNotifications()
-      .subscribe({ abortSignal: abortController.signal });
+let resolveSlotPromise;
+let nextSlotPromise;
 
-    for await (const notification of slotNotifications) {
-      if (notification.type === "firstShredReceived") {
-        gSlotSent.value = notification.slot;
-        gSlotSent.updated_at = Date.now();
-        attempts = 0;
-        continue;
-      }
-
-      gSlotSent.value = null;
-      gSlotSent.updated_at = 0;
-
-      ++attempts;
-
-      if (attempts >= MAX_SLOT_FETCH_ATTEMPTS) {
-        console.log(
-          `ERROR: Max attempts for fetching slot type "firstShredReceived" reached, exiting`
-        );
-        process.exit(0);
-      }
-
-      // If update not received in last 3s, re-subscribe
-      if (gSlotSent.value !== null) {
-        while (Date.now() - gSlotSent.updated_at < 3000) {
-          await sleep(1);
+(async () => {
+  let attempts = 0;
+  while (true) {
+    try {
+      const slotNotifications = await rpcSubscriptions
+        .slotsUpdatesNotifications()
+        .subscribe({ abortSignal: AbortSignal.any([]) });
+      for await (const { slot, type } of slotNotifications) {
+        if (type === "firstShredReceived") {
+          attempts = 0;
+          if (resolveSlotPromise) {
+            resolveSlotPromise(slot);
+          }
+          resolveSlotPromise = undefined;
+          nextSlotPromise = undefined;
+          continue;
+        }
+        if (++attempts >= MAX_SLOT_FETCH_ATTEMPTS) {
+          console.log(
+            `ERROR: Max attempts for fetching slot type "firstShredReceived" reached, exiting`
+          );
+          process.exit(0);
         }
       }
+    } catch (e) {
+      console.log(`ERROR: ${e}`);
+      ++attempts;
     }
-  } catch (e) {
-    console.log(`ERROR: ${e}`);
-    ++attempts;
   }
-};
+})();
+
+export async function getNextSlot() {
+  nextSlotPromise ||= new Promise((resolve) => {
+    resolveSlotPromise = resolve
+  });
+  return await nextSlotPromise;
+}
