@@ -52,6 +52,18 @@ if (VERBOSE_LOG) console.log(`Starting script`);
 let USER_KEYPAIR;
 const TX_RETRY_INTERVAL = 2000;
 
+setMaxListeners(100);
+
+const mSendTransaction = sendTransactionWithoutConfirmingFactory({
+  rpc,
+});
+
+const getRecentSignatureConfirmationPromise =
+  createRecentSignatureConfirmationPromiseFactory({
+    rpc,
+    rpcSubscriptions,
+  });
+
 async function pingThing() {
   USER_KEYPAIR = await createKeyPairFromBytes(
     bs58.decode(process.env.WALLET_PRIVATE_KEYPAIR)
@@ -107,16 +119,6 @@ async function pingThing() {
 
         console.log(`Sending ${signature}`);
 
-        const mSendTransaction = sendTransactionWithoutConfirmingFactory({
-          rpc,
-        });
-
-        const getRecentSignatureConfirmationPromise =
-          createRecentSignatureConfirmationPromiseFactory({
-            rpc,
-            rpcSubscriptions,
-          });
-        setMaxListeners(100);
         const abortController = new AbortController();
 
         slotSent = await getNextSlot();
