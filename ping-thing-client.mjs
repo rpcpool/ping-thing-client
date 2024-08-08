@@ -1,3 +1,4 @@
+import { safeRace } from "@solana/promises";
 import {
   createTransactionMessage,
   pipe,
@@ -6,19 +7,18 @@ import {
   createKeyPairFromBytes,
   createSignerFromKeyPair,
   appendTransactionMessageInstructions,
-  sendTransactionWithoutConfirmingFactory,
   signTransactionMessageWithSigners,
   SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
   isSolanaError,
   getSignatureFromTransaction,
+  sendAndConfirmTransactionFactory,
   // Address,
 } from "@solana/web3.js";
 import dotenv from "dotenv";
 import bs58 from "bs58";
 import { getSetComputeUnitLimitInstruction } from "@solana-program/compute-budget";
 import { getTransferSolInstruction } from "@solana-program/system";
-import { createRecentSignatureConfirmationPromiseFactory } from "@solana/transaction-confirmation";
-import { sleep } from "./utils/misc.mjs";
+import { sleep, timeout } from "./utils/misc.mjs";
 import { getLatestBlockhash } from "./utils/blockhash.mjs";
 import { rpc, rpcSubscriptions } from "./utils/rpc.mjs";
 import { getNextSlot } from "./utils/slot.mjs";
@@ -54,15 +54,10 @@ const TX_RETRY_INTERVAL = 2000;
 
 setMaxListeners(100);
 
-const mSendTransaction = sendTransactionWithoutConfirmingFactory({
+const mSendAndConfirmTransaction = sendAndConfirmTransactionFactory({
   rpc,
+  rpcSubscriptions,
 });
-
-const getRecentSignatureConfirmationPromise =
-  createRecentSignatureConfirmationPromiseFactory({
-    rpc,
-    rpcSubscriptions,
-  });
 
 async function pingThing() {
   USER_KEYPAIR = await createKeyPairFromBytes(
@@ -122,31 +117,27 @@ async function pingThing() {
         while (true) {
           try {
             slotSent = await getNextSlot();
-            await mSendTransaction(transactionSignedWithFeePayer, {
-              commitment: "confirmed",
-              maxRetries: 0n,
-              skipPreflight: true,
-            })
-
-            await Promise.race([
-              getRecentSignatureConfirmationPromise({
-                signature,
+            await safeRace([
+              mSendAndConfirmTransaction(transactionSignedWithFeePayer, {
                 commitment: "confirmed",
+                maxRetries: 0n,
+                skipPreflight: true,
               }),
-              sleep(TX_RETRY_INTERVAL * txSendAttempts).then(() => {
-                throw new Error("Tx Send Timeout");
-              }),
+              timeout(TX_RETRY_INTERVAL * txSendAttempts),
             ]);
 
             console.log(`Confirmed tx ${signature}`);
 
             break;
           } catch (e) {
-            console.log(
-              `Tx not confirmed after ${
-                TX_RETRY_INTERVAL * txSendAttempts++
-              }ms, resending`
-            );
+            if (e.message === "Timeout") {
+              console.log(
+                `Tx not confirmed after ${TX_RETRY_INTERVAL * txSendAttempts++
+                }ms, resending`
+              );
+            } else {
+              throw e;
+            }
           }
         }
       } catch (e) {
