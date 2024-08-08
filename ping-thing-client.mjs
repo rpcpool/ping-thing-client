@@ -66,7 +66,24 @@ async function pingThing() {
   let tryCount = 0;
 
   const signer = await createSignerFromKeyPair(USER_KEYPAIR);
-
+  const BASE_TRANSACTION_MESSAGE = pipe(
+    createTransactionMessage({ version: 0 }),
+    (tx) => setTransactionMessageFeePayer(signer.address, tx),
+    (tx) =>
+      appendTransactionMessageInstructions(
+        [
+          getSetComputeUnitLimitInstruction({
+            units: 500,
+          }),
+          getTransferSolInstruction({
+            source: signer,
+            destination: signer.address,
+            amount: 5000,
+          }),
+        ],
+        tx
+      )
+  );
   while (true) {
     await sleep(SLEEP_MS_LOOP);
 
@@ -79,32 +96,13 @@ async function pingThing() {
     try {
       try {
         const latestBlockhash = await getLatestBlockhash();
-        const transaction = pipe(
-          createTransactionMessage({ version: 0 }),
-          (tx) => setTransactionMessageFeePayer(signer.address, tx),
-          (tx) =>
-            setTransactionMessageLifetimeUsingBlockhash(
-              latestBlockhash,
-              tx
-            ),
-          (tx) =>
-            appendTransactionMessageInstructions(
-              [
-                getSetComputeUnitLimitInstruction({
-                  units: 500,
-                }),
-                getTransferSolInstruction({
-                  source: signer,
-                  destination: signer.address,
-                  amount: 5000,
-                }),
-              ],
-              tx
-            )
+        const transactionMessage = setTransactionMessageLifetimeUsingBlockhash(
+          latestBlockhash,
+          BASE_TRANSACTION_MESSAGE
         );
         const transactionSignedWithFeePayer = await signTransaction(
           [USER_KEYPAIR],
-          compileTransaction(transaction)
+          compileTransaction(transactionMessage)
         );
         signature = getSignatureFromTransaction(transactionSignedWithFeePayer);
 
