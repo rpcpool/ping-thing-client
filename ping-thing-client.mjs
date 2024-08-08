@@ -120,6 +120,8 @@ async function pingThing() {
             await safeRace([
               mSendAndConfirmTransaction(transactionSignedWithFeePayer, {
                 commitment: "confirmed",
+                maxRetries: 0n,
+                skipPreflight: true,
               }),
               timeout(TX_RETRY_INTERVAL * txSendAttempts),
             ]);
