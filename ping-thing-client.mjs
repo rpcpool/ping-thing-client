@@ -1,5 +1,4 @@
 import {
-  createDefaultRpcTransport,
   createTransactionMessage,
   pipe,
   setTransactionMessageFeePayer,
@@ -10,10 +9,8 @@ import {
   signTransaction,
   appendTransactionMessageInstructions,
   sendTransactionWithoutConfirmingFactory,
-  createSolanaRpcSubscriptions_UNSTABLE,
   getSignatureFromTransaction,
   compileTransaction,
-  createSolanaRpc,
   SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND
   // Address,
 } from "@solana/web3.js";
@@ -24,6 +21,7 @@ import { getTransferSolInstruction } from "@solana-program/system";
 import { createRecentSignatureConfirmationPromiseFactory } from "@solana/transaction-confirmation";
 import { sleep } from "./utils/misc.mjs";
 import { watchBlockhash } from "./utils/blockhash.mjs";
+import { rpc, rpcSubscriptions } from "./utils/rpc.mjs";
 import { watchSlotSent } from "./utils/slot.mjs";
 import { setMaxListeners } from "events";
 import axios from "axios";
@@ -42,10 +40,6 @@ process.on("SIGINT", function () {
   process.exit();
 });
 
-
-const RPC_ENDPOINT = process.env.RPC_ENDPOINT;
-const WS_ENDPOINT = process.env.WS_ENDPOINT;
-
 const SLEEP_MS_RPC = process.env.SLEEP_MS_RPC || 2000;
 const SLEEP_MS_LOOP = process.env.SLEEP_MS_LOOP || 0;
 const VA_API_KEY = process.env.VA_API_KEY;
@@ -55,12 +49,6 @@ const USE_PRIORITY_FEE = process.env.USE_PRIORITY_FEE == "true" ? true : false;
 const SKIP_VALIDATORS_APP = process.env.SKIP_VALIDATORS_APP || false;
 
 if (VERBOSE_LOG) console.log(`Starting script`);
-
-const connection = createSolanaRpc(RPC_ENDPOINT)
-
-const rpcSubscriptions = createSolanaRpcSubscriptions_UNSTABLE(
-  WS_ENDPOINT
-);
 
 let USER_KEYPAIR;
 const TX_RETRY_INTERVAL = 2000;
@@ -148,12 +136,12 @@ async function pingThing() {
         console.log(`Sending ${signature}`);
 
         const mSendTransaction = sendTransactionWithoutConfirmingFactory({
-          rpc: connection,
+          rpc,
         });
 
         const getRecentSignatureConfirmationPromise =
           createRecentSignatureConfirmationPromiseFactory({
-            rpc: connection,
+            rpc,
             rpcSubscriptions,
           });
         setMaxListeners(100);
@@ -220,7 +208,7 @@ async function pingThing() {
       await sleep(SLEEP_MS_RPC);
       if (signature !== FAKE_SIGNATURE) {
         // Capture the slotLanded
-        let txLanded = await connection
+        let txLanded = await rpc
           .getTransaction(signature, {
             commitment: COMMITMENT_LEVEL,
             maxSupportedTransactionVersion: 255,
@@ -297,7 +285,7 @@ async function pingThing() {
 }
 
 await Promise.all([
-  watchBlockhash(gBlockhash, connection),
-  watchSlotSent(gSlotSent, rpcSubscriptions),
+  watchBlockhash(gBlockhash),
+  watchSlotSent(gSlotSent),
   pingThing(),
 ]);

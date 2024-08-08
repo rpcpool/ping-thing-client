@@ -1,12 +1,11 @@
 import { sleep } from "./misc.mjs";
-
-import { createSolanaRpcSubscriptions_UNSTABLE } from "@solana/web3.js";
+import { rpcSubscriptions } from "./rpc.mjs";
 
 const MAX_SLOT_FETCH_ATTEMPTS = process.env.MAX_SLOT_FETCH_ATTEMPTS || 100;
 let attempts = 0;
 const abortController = new AbortController();
 
-export const watchSlotSent = async (gSlotSent, rpcSubscriptions) => {
+export const watchSlotSent = async (gSlotSent) => {
   try {
     const slotNotifications = await rpcSubscriptions
       .slotsUpdatesNotifications()
