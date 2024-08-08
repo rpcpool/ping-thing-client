@@ -11,7 +11,8 @@ import {
   sendTransactionWithoutConfirmingFactory,
   getSignatureFromTransaction,
   compileTransaction,
-  SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND
+  SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
+  isSolanaError,
   // Address,
 } from "@solana/web3.js";
 import dotenv from "dotenv";
