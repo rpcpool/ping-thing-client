@@ -1,64 +1,98 @@
-import { sleep } from "./misc.mjs";
-import { rpc } from "./rpc.mjs";
+import { safeRace } from "@solana/promises";
+import { address } from "@solana/web3.js";
+
+import { timeout } from "./misc.mjs";
+import { rpc, rpcSubscriptions } from "./rpc.mjs";
 
 const MAX_BLOCKHASH_FETCH_ATTEMPTS = process.env.MAX_BLOCKHASH_FETCH_ATTEMPTS || 5;
-let attempts = 0;
+const RECENT_BLOCKHASHES_ADDRESS = address(
+  "SysvarRecentB1ockHashes11111111111111111111"
+);
 
-export const watchBlockhash = async (gBlockhash) => {
-  // const gBlockhash = { value: null, updated_at: 0 };
-  while (true) {
-    try {
-      // Use a 5 second timeout to avoid hanging the script
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(
-          () =>
-            reject(
-              new Error(
-                `${new Date().toISOString()} ERROR: Blockhash fetch operation timed out`
-              )
-            ),
-          5000
-        )
-      );
-      // Get the latest blockhash from the RPC node and update the global
-      // blockhash object with the new value and timestamp. If the RPC node
-      // fails to respond within 5 seconds, the promise will reject and the
-      // script will log an error.
-      const latestBlockhash = await Promise.race([
-        rpc.getLatestBlockhash().send(),
-        timeoutPromise,
-      ]);
+async function getDifferenceBetweenSlotHeightAndBlockHeight() {
+  const { absoluteSlot, blockHeight } = await rpc
+    .getEpochInfo()
+    .send({ abortSignal: AbortSignal.any([]) });
+  return absoluteSlot - blockHeight;
+}
 
-      gBlockhash.value = latestBlockhash.value.blockhash;
-      gBlockhash.lastValidBlockHeight = latestBlockhash.value.lastValidBlockHeight;
+function getLatestBlockhashFromNotification(
+  {
+    context: { slot },
+    value: {
+      data: {
+        parsed: {
+          info: [{ blockhash }],
+        },
+      },
+    },
+  },
+  differenceBetweenSlotHeightAndBlockHeight
+) {
+  return {
+    blockhash,
+    lastValidBlockHeight: (slot - differenceBetweenSlotHeightAndBlockHeight) + 150n,
+  };
+}
 
-      gBlockhash.updated_at = Date.now();
-      attempts = 0;
-    } catch (error) {
-      gBlockhash.value = null;
-      gBlockhash.updated_at = 0;
-
-      ++attempts;
-
-      if (error.message.includes("new blockhash")) {
-        console.log(
-          `${new Date().toISOString()} ERROR: Unable to obtain a new blockhash`
+let differenceBetweenSlotHeightAndBlockHeight;
+let latestBlockhash;
+let recentBlockhashesNotifications;
+async function* blockhashes() {
+  if (latestBlockhash !== undefined) {
+    yield latestBlockhash;
+  }
+  if (recentBlockhashesNotifications === undefined) {
+    [
+      differenceBetweenSlotHeightAndBlockHeight,
+      recentBlockhashesNotifications,
+    ] = await safeRace([
+      Promise.all([
+        getDifferenceBetweenSlotHeightAndBlockHeight(),
+        rpcSubscriptions
+          .accountNotifications(RECENT_BLOCKHASHES_ADDRESS, {
+            encoding: "jsonParsed",
+          })
+          .subscribe({ abortSignal: AbortSignal.any([]) }),
+      ]),
+      // If the RPC node fails to respond within 5 seconds, throw an error.
+      timeout(5000),
+    ]);
+    // Iterate over the notificatons forever, constantly updating the `latestBlockhash` cache.
+    (async () => {
+      for await (const notification of recentBlockhashesNotifications) {
+        latestBlockhash = getLatestBlockhashFromNotification(
+          notification,
+          differenceBetweenSlotHeightAndBlockHeight
         );
-      } else {
-        console.log(`${new Date().toISOString()} ERROR: ${error.name}`);
-        console.log(error.message);
-        console.log(error);
-        console.log(JSON.stringify(error));
       }
-    } finally {
-      if (attempts >= MAX_BLOCKHASH_FETCH_ATTEMPTS) {
-        console.log(
-          `${new Date().toISOString()} ERROR: Max attempts for fetching blockhash reached, exiting`
-        );
+    })();
+  }
+  for await (const notification of recentBlockhashesNotifications) {
+    latestBlockhash = getLatestBlockhashFromNotification(
+      notification,
+      differenceBetweenSlotHeightAndBlockHeight
+    );
+    yield latestBlockhash;
+  }
+}
+
+export async function getLatestBlockhash() {
+  while (true) {
+    let attempts = 0;
+    try {
+      const { value: latestBlockhash } = await blockhashes().next();
+      return latestBlockhash;
+    } catch (e) {
+      if (e.message === 'Timeout') {
+        console.error(`${new Date().toISOString()} ERROR: Blockhash fetch operation timed out`);
+      } else {
+        console.error(e);
+      }
+      if (++attempts >= MAX_BLOCKHASH_FETCH_ATTEMPTS) {
+        console.error(`${new Date().toISOString()} ERROR: Max attempts for fetching blockhash reached, exiting`)
         process.exit(0);
       }
     }
-
-    await sleep(5000);
   }
-};
+}
