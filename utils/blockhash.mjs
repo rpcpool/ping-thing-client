@@ -1,9 +1,10 @@
 import { sleep } from "./misc.mjs";
+import { rpc } from "./rpc.mjs";
 
 const MAX_BLOCKHASH_FETCH_ATTEMPTS = process.env.MAX_BLOCKHASH_FETCH_ATTEMPTS || 5;
 let attempts = 0;
 
-export const watchBlockhash = async (gBlockhash, connection) => {
+export const watchBlockhash = async (gBlockhash) => {
   // const gBlockhash = { value: null, updated_at: 0 };
   while (true) {
     try {
@@ -24,7 +25,7 @@ export const watchBlockhash = async (gBlockhash, connection) => {
       // fails to respond within 5 seconds, the promise will reject and the
       // script will log an error.
       const latestBlockhash = await Promise.race([
-        connection.getLatestBlockhash().send(),
+        rpc.getLatestBlockhash().send(),
         timeoutPromise,
       ]);
 
