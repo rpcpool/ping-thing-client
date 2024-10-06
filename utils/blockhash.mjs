@@ -17,30 +17,32 @@ async function getDifferenceBetweenSlotHeightAndBlockHeight() {
   return absoluteSlot - blockHeight;
 }
 
-function getLatestBlockhashFromNotification(
+function getLatestBlockhashesFromNotification(
   {
     context: { slot },
     value: {
       data: {
         parsed: {
-          info: [{ blockhash }],
+          info: blockhashes,
         },
       },
     },
   },
   differenceBetweenSlotHeightAndBlockHeight
 ) {
-  return {
+  return blockhashes.map(({ blockhash }) => ({
     blockhash,
     lastValidBlockHeight:
       slot - differenceBetweenSlotHeightAndBlockHeight + 150n,
-  };
+  }));
 }
 
-let resolveInitialLatestBlockhash;
-let latestBlockhashPromise = new Promise((resolve) => {
-  resolveInitialLatestBlockhash = resolve;
+let resolveInitialLatestBlockhashes;
+let latestBlockhashesPromise = new Promise((resolve) => {
+  resolveInitialLatestBlockhashes = resolve;
 });
+
+let usedBlockhashes = new Set();
 
 (async () => {
   let attempts = 0;
@@ -61,18 +63,25 @@ let latestBlockhashPromise = new Promise((resolve) => {
         // If the RPC node fails to respond within 5 seconds, throw an error.
         timeout(5000),
       ]);
-      // Iterate over the notificatons forever, constantly updating the `latestBlockhash` cache.
+      // Iterate over the notificatons forever, constantly updating the `latestBlockhashes` cache.
       for await (const notification of recentBlockhashesNotifications) {
-        const nextLatestBlockhash = getLatestBlockhashFromNotification(
+        const nextLatestBlockhashes = getLatestBlockhashesFromNotification(
           notification,
           differenceBetweenSlotHeightAndBlockHeight
         );
+        const nextUsedBlockhashes = new Set();
+        for (const { blockhash } of nextLatestBlockhashes) {
+          if (usedBlockhashes.has(blockhash)) {
+            nextUsedBlockhashes.add(blockhash)
+          }
+        }
+        usedBlockhashes = nextUsedBlockhashes;
         attempts = 0;
-        if (resolveInitialLatestBlockhash) {
-          resolveInitialLatestBlockhash(nextLatestBlockhash);
-          resolveInitialLatestBlockhash = undefined;
+        if (resolveInitialLatestBlockhashes) {
+          resolveInitialLatestBlockhashes(nextLatestBlockhashes);
+          resolveInitialLatestBlockhashes = undefined;
         } else {
-          latestBlockhashPromise = Promise.resolve(nextLatestBlockhash);
+          latestBlockhashesPromise = Promise.resolve(nextLatestBlockhashes);
         }
       }
     } catch (e) {
@@ -94,5 +103,16 @@ let latestBlockhashPromise = new Promise((resolve) => {
 })();
 
 export async function getLatestBlockhash() {
-  return await latestBlockhashPromise;
+  const latestBlockhashes = await latestBlockhashesPromise;
+  const latestUnusedBlockhash = latestBlockhashes.find(
+    ({ blockhash }) => !usedBlockhashes.has(blockhash),
+  );
+  if (!latestUnusedBlockhash) {
+    console.error(
+      `${new Date().toISOString()} ERROR: Ran out of unused blockhashes before the subscription could replenish them`,
+    );
+    process.exit(0);
+  }
+  usedBlockhashes.add(latestUnusedBlockhash.blockhash);
+  return latestUnusedBlockhash;
 }
