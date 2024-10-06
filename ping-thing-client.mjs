@@ -110,13 +110,14 @@ async function pingThing() {
           await signTransactionMessageWithSigners(transactionMessage);
         signature = getSignatureFromTransaction(transactionSignedWithFeePayer);
 
-        txStart = Date.now();
-
         console.log(`Sending ${signature}`);
 
         while (true) {
           try {
             slotSent = await getNextSlot();
+
+            txStart = Date.now();
+
             await safeRace([
               mSendAndConfirmTransaction(transactionSignedWithFeePayer, {
                 commitment: "confirmed",
