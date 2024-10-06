@@ -1,4 +1,3 @@
-import { safeRace } from "@solana/promises";
 import {
   createTransactionMessage,
   pipe,
@@ -11,19 +10,20 @@ import {
   SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
   isSolanaError,
   getSignatureFromTransaction,
-  sendAndConfirmTransactionFactory,
+  sendTransactionWithoutConfirmingFactory,
   // Address,
 } from "@solana/web3.js";
 import dotenv from "dotenv";
 import bs58 from "bs58";
 import { getSetComputeUnitLimitInstruction } from "@solana-program/compute-budget";
 import { getTransferSolInstruction } from "@solana-program/system";
-import { sleep, timeout } from "./utils/misc.mjs";
+import { sleep } from "./utils/misc.mjs";
 import { getLatestBlockhash } from "./utils/blockhash.mjs";
 import { rpc, rpcSubscriptions } from "./utils/rpc.mjs";
 import { getNextSlot } from "./utils/slot.mjs";
 import { setMaxListeners } from "events";
 import axios from "axios";
+import { createRecentSignatureConfirmationPromiseFactory } from "@solana/transaction-confirmation";
 
 dotenv.config();
 
@@ -58,10 +58,11 @@ const TX_RETRY_INTERVAL = 2000;
 
 setMaxListeners(100);
 
-const mSendAndConfirmTransaction = sendAndConfirmTransactionFactory({
+const mConfirmRecentSignature = createRecentSignatureConfirmationPromiseFactory({
   rpc,
   rpcSubscriptions,
 });
+const mSendTransactionWithoutConfirming = sendTransactionWithoutConfirmingFactory({ rpc });
 
 async function pingThing() {
   USER_KEYPAIR = await createKeyPairFromBytes(
@@ -104,6 +105,7 @@ async function pingThing() {
     let txSendAttempts = 1;
 
     try {
+      const pingAbortController = new AbortController();
       try {
         const latestBlockhash = await getLatestBlockhash();
         const transactionMessage = setTransactionMessageLifetimeUsingBlockhash(
@@ -116,35 +118,40 @@ async function pingThing() {
 
         console.log(`Sending ${signature}`);
 
-        while (true) {
-          try {
-            slotSent = await getNextSlot();
-
-            txStart = Date.now();
-
-            await safeRace([
-              mSendAndConfirmTransaction(transactionSignedWithFeePayer, {
-                commitment: "confirmed",
-                maxRetries: 0n,
-                skipPreflight: true,
-              }),
-              timeout(TX_RETRY_INTERVAL * txSendAttempts),
-            ]);
-
-            console.log(`Confirmed tx ${signature}`);
-
-            break;
-          } catch (e) {
-            if (e.message === "Timeout") {
-              console.log(
-                `Tx not confirmed after ${TX_RETRY_INTERVAL * txSendAttempts++
-                }ms, resending`
-              );
+        let sendAbortController;
+        function sendTransaction() {
+          sendAbortController = new AbortController()
+          mSendTransactionWithoutConfirming(transactionSignedWithFeePayer, {
+            abortSignal: sendAbortController.signal,
+            commitment: COMMITMENT_LEVEL,
+            maxRetries: 0n,
+            skipPreflight: true,
+          }).catch(e => {
+            if (e instanceof Error && e.name === 'AbortError') {
+              return;
             } else {
               throw e;
             }
-          }
+          });
         }
+        slotSent = await getNextSlot();
+        const sendRetryInterval = setInterval(() => {
+          sendAbortController.abort();
+          console.log(`Tx not confirmed after ${TX_RETRY_INTERVAL * txSendAttempts++}ms, resending`);
+          sendTransaction();
+        }, TX_RETRY_INTERVAL);
+        pingAbortController.signal.addEventListener('abort', () => {
+          clearInterval(sendRetryInterval);
+          sendAbortController.abort();
+        });
+        txStart = Date.now();
+        sendTransaction();
+        await mConfirmRecentSignature({
+          abortSignal: pingAbortController.signal,
+          commitment: COMMITMENT_LEVEL,
+          signature,
+        });
+        console.log(`Confirmed tx ${signature}`);
       } catch (e) {
         // Log and loop if we get a bad blockhash.
         if (isSolanaError(e, SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND)) {
@@ -169,6 +176,8 @@ async function pingThing() {
 
         // Need to submit a fake signature to pass the import filters
         signature = FAKE_SIGNATURE;
+      } finally {
+        pingAbortController.abort();
       }
 
       const txEnd = Date.now();
