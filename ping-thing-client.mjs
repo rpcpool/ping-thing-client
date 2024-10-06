@@ -27,6 +27,10 @@ import axios from "axios";
 
 dotenv.config();
 
+function safeJSONStringify(val) {
+  return JSON.stringify(val, (_, val) => typeof val === 'bigint' ? val.toString() : val);
+}
+
 const orignalConsoleLog = console.log;
 console.log = function (...message) {
   const dateTime = new Date().toUTCString();
@@ -159,7 +163,7 @@ async function pingThing() {
           console.log(`ERROR: ${e.name}`);
           console.log(e.message);
           console.log(e);
-          console.log(JSON.stringify(e));
+          console.log(safeJSONStringify(e));
           continue;
         }
 
@@ -198,7 +202,7 @@ async function pingThing() {
       }
 
       // prepare the payload to send to validators.app
-      const vAPayload = JSON.stringify({
+      const vAPayload = safeJSONStringify({
         time: txEnd - txStart,
         signature,
         transaction_type: "transfer",
@@ -231,9 +235,8 @@ async function pingThing() {
 
         if (VERBOSE_LOG) {
           console.log(
-            `VA Response ${
-              vaResponse.status
-            } ${JSON.stringify(vaResponse.data)}`
+            `VA Response ${vaResponse.status
+            } ${safeJSONStringify(vaResponse.data)}`
           );
         }
       }
