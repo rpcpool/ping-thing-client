@@ -1,5 +1,8 @@
+import dotenv from 'dotenv';
 import { createCipheriv } from "crypto";
 import { rpcSubscriptions } from "./rpc.mjs";
+
+dotenv.config();
 
 const MAX_SLOT_FETCH_ATTEMPTS = process.env.MAX_SLOT_FETCH_ATTEMPTS || 100;
 
