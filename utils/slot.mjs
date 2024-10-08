@@ -17,10 +17,19 @@ let nextSlotPromise;
         .slotsUpdatesNotifications()
         .subscribe({ abortSignal: AbortSignal.any([]) });
       for await (const { slot, type } of slotNotifications) {
-        if (type === "firstShredReceived") {
+        let nextSlot;
+        switch (type) {
+          case 'completed':
+            nextSlot = slot + 1n;
+            break;
+          case 'firstShredReceived':
+            nextSlot = slot;
+            break
+        }
+        if (nextSlot != null) {
           attempts = 0;
           if (resolveSlotPromise) {
-            resolveSlotPromise(slot);
+            resolveSlotPromise(nextSlot);
           }
           resolveSlotPromise = undefined;
           nextSlotPromise = undefined;
@@ -28,7 +37,7 @@ let nextSlotPromise;
         }
         if (++attempts >= MAX_SLOT_FETCH_ATTEMPTS) {
           console.log(
-            `ERROR: Max attempts for fetching slot type "firstShredReceived" reached, exiting`
+            `ERROR: Max attempts for fetching slot type "completed" or "firstShredReceived" reached, exiting`
           );
           process.exit(0);
         }
