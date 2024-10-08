@@ -1,3 +1,7 @@
+import whyIsNodeRunning from 'why-is-node-running';
+// To access this at any time, attach the debugger, press pause, and type `whyIsNodeRunning()`.
+globalThis.whyIsNodeRunning = whyIsNodeRunning;
+
 import {
   createTransactionMessage,
   pipe,
