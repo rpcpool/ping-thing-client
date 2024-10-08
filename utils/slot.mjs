@@ -6,11 +6,15 @@ let attempts = 0;
 export const watchSlotSent = async (gSlotSent, connection) => {
   while (true) {
     try {
+      let lastSlot = 0;
       const subscriptionId = connection.onSlotUpdate((value) => {
-        if (value.type === "firstShredReceived") {
-          gSlotSent.value = value.slot;
-          gSlotSent.updated_at = Date.now();
-          attempts = 0;
+        if (value.type === "firstShredReceived" || value.type == "completed") {
+          if value.slot > lastSlot {
+            lastSlot = value.slot;
+            gSlotSent.value = value.slot;
+            gSlotSent.updated_at = Date.now();
+            attempts = 0;
+          }
         }
       });
 
