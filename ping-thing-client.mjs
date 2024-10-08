@@ -1,34 +1,39 @@
+import whyIsNodeRunning from 'why-is-node-running';
+// To access this at any time, attach the debugger, press pause, and type `whyIsNodeRunning()`.
+globalThis.whyIsNodeRunning = whyIsNodeRunning;
+
 import {
-  createDefaultRpcTransport,
   createTransactionMessage,
   pipe,
-  setTransactionMessageFeePayer,
+  setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
   createKeyPairFromBytes,
-  getAddressFromPublicKey,
   createSignerFromKeyPair,
-  signTransaction,
   appendTransactionMessageInstructions,
-  sendTransactionWithoutConfirmingFactory,
-  createSolanaRpcSubscriptions_UNSTABLE,
+  signTransactionMessageWithSigners,
+  SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
+  isSolanaError,
   getSignatureFromTransaction,
-  compileTransaction,
-  createSolanaRpc,
-  SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND
+  sendTransactionWithoutConfirmingFactory,
   // Address,
 } from "@solana/web3.js";
 import dotenv from "dotenv";
 import bs58 from "bs58";
 import { getSetComputeUnitLimitInstruction } from "@solana-program/compute-budget";
 import { getTransferSolInstruction } from "@solana-program/system";
-import { createRecentSignatureConfirmationPromiseFactory } from "@solana/transaction-confirmation";
 import { sleep } from "./utils/misc.mjs";
-import { watchBlockhash } from "./utils/blockhash.mjs";
-import { watchSlotSent } from "./utils/slot.mjs";
+import { getLatestBlockhash } from "./utils/blockhash.mjs";
+import { rpc, rpcSubscriptions } from "./utils/rpc.mjs";
+import { getNextSlot } from "./utils/slot.mjs";
 import { setMaxListeners } from "events";
 import axios from "axios";
+import { createRecentSignatureConfirmationPromiseFactory } from "@solana/transaction-confirmation";
 
 dotenv.config();
+
+function safeJSONStringify(val) {
+  return JSON.stringify(val, (_, val) => typeof val === 'bigint' ? val.toString() : val);
+}
 
 const orignalConsoleLog = console.log;
 console.log = function (...message) {
@@ -42,10 +47,6 @@ process.on("SIGINT", function () {
   process.exit();
 });
 
-
-const RPC_ENDPOINT = process.env.RPC_ENDPOINT;
-const WS_ENDPOINT = process.env.WS_ENDPOINT;
-
 const SLEEP_MS_RPC = process.env.SLEEP_MS_RPC || 2000;
 const SLEEP_MS_LOOP = process.env.SLEEP_MS_LOOP || 0;
 const VA_API_KEY = process.env.VA_API_KEY;
@@ -56,19 +57,17 @@ const SKIP_VALIDATORS_APP = process.env.SKIP_VALIDATORS_APP || false;
 
 if (VERBOSE_LOG) console.log(`Starting script`);
 
-const connection = createSolanaRpc(RPC_ENDPOINT)
-
-const rpcSubscriptions = createSolanaRpcSubscriptions_UNSTABLE(
-  WS_ENDPOINT
-);
-
 let USER_KEYPAIR;
 const TX_RETRY_INTERVAL = 2000;
 
-const gBlockhash = { value: null, updated_at: 0, lastValidBlockHeight: 0 };
+setMaxListeners(100);
 
-// Record new slot on `firstShredReceived`
-const gSlotSent = { value: null, updated_at: 0 };
+const mConfirmRecentSignature = createRecentSignatureConfirmationPromiseFactory({
+  rpc,
+  rpcSubscriptions,
+});
+const mSendTransactionWithoutConfirming = sendTransactionWithoutConfirmingFactory({ rpc });
+
 async function pingThing() {
   USER_KEYPAIR = await createKeyPairFromBytes(
     bs58.decode(process.env.WALLET_PRIVATE_KEYPAIR)
@@ -81,114 +80,82 @@ async function pingThing() {
   const MAX_TRIES = 3;
   let tryCount = 0;
 
-  const feePayer = await getAddressFromPublicKey(USER_KEYPAIR.publicKey);
   const signer = await createSignerFromKeyPair(USER_KEYPAIR);
-
+  const BASE_TRANSACTION_MESSAGE = pipe(
+    createTransactionMessage({ version: 0 }),
+    (tx) => setTransactionMessageFeePayerSigner(signer, tx),
+    (tx) =>
+      appendTransactionMessageInstructions(
+        [
+          getSetComputeUnitLimitInstruction({
+            units: 500,
+          }),
+          getTransferSolInstruction({
+            source: signer,
+            destination: signer.address,
+            amount: 5000,
+          }),
+        ],
+        tx
+      )
+  );
   while (true) {
     await sleep(SLEEP_MS_LOOP);
 
-    let blockhash;
-    let lastValidBlockHeight;
     let slotSent;
     let slotLanded;
     let signature;
     let txStart;
     let txSendAttempts = 1;
 
-    // Wait fresh data
-    while (true) {
-      if (
-        Date.now() - gBlockhash.updated_at < 10000 &&
-        Date.now() - gSlotSent.updated_at < 50
-      ) {
-        blockhash = gBlockhash.value;
-        lastValidBlockHeight = gBlockhash.lastValidBlockHeight;
-        slotSent = gSlotSent.value;
-        break;
-      }
-
-      await sleep(1);
-    }
     try {
+      const pingAbortController = new AbortController();
       try {
-        const transaction = pipe(
-          createTransactionMessage({ version: 0 }),
-          (tx) => setTransactionMessageFeePayer(feePayer, tx),
-          (tx) =>
-            setTransactionMessageLifetimeUsingBlockhash(
-              {
-                blockhash: gBlockhash.value,
-                lastValidBlockHeight: gBlockhash.lastValidBlockHeight,
-              },
-              tx
-            ),
-          (tx) =>
-            appendTransactionMessageInstructions(
-              [
-                getSetComputeUnitLimitInstruction({
-                  units: 500,
-                }),
-                getTransferSolInstruction({
-                  source: signer,
-                  destination: feePayer,
-                  amount: 5000,
-                }),
-              ],
-              tx
-            )
+        const latestBlockhash = await getLatestBlockhash();
+        const transactionMessage = setTransactionMessageLifetimeUsingBlockhash(
+          latestBlockhash,
+          BASE_TRANSACTION_MESSAGE
         );
-        const transactionSignedWithFeePayer = await signTransaction(
-          [USER_KEYPAIR],
-          compileTransaction(transaction)
-        );
+        const transactionSignedWithFeePayer =
+          await signTransactionMessageWithSigners(transactionMessage);
         signature = getSignatureFromTransaction(transactionSignedWithFeePayer);
-
-        txStart = Date.now();
 
         console.log(`Sending ${signature}`);
 
-        const mSendTransaction = sendTransactionWithoutConfirmingFactory({
-          rpc: connection,
-        });
-
-        const getRecentSignatureConfirmationPromise =
-          createRecentSignatureConfirmationPromiseFactory({
-            rpc: connection,
-            rpcSubscriptions,
+        let sendAbortController;
+        function sendTransaction() {
+          sendAbortController = new AbortController()
+          mSendTransactionWithoutConfirming(transactionSignedWithFeePayer, {
+            abortSignal: sendAbortController.signal,
+            commitment: COMMITMENT_LEVEL,
+            maxRetries: 0n,
+            skipPreflight: true,
+          }).catch(e => {
+            if (e instanceof Error && e.name === 'AbortError') {
+              return;
+            } else {
+              throw e;
+            }
           });
-        setMaxListeners(100);
-        const abortController = new AbortController();
-
-        while (true) {
-          try {
-            await mSendTransaction(transactionSignedWithFeePayer, {
-              commitment: "confirmed",
-              maxRetries: 0n,
-              skipPreflight: true,
-            });
-
-            await Promise.race([
-              getRecentSignatureConfirmationPromise({
-                signature,
-                commitment: "confirmed",
-                abortSignal: abortController.signal,
-              }),
-              sleep(TX_RETRY_INTERVAL * txSendAttempts).then(() => {
-                throw new Error("Tx Send Timeout");
-              }),
-            ]);
-
-            console.log(`Confirmed tx ${signature}`);
-
-            break;
-          } catch (e) {
-            console.log(
-              `Tx not confirmed after ${
-                TX_RETRY_INTERVAL * txSendAttempts++
-              }ms, resending`
-            );
-          }
         }
+        slotSent = await getNextSlot();
+        const sendRetryInterval = setInterval(() => {
+          sendAbortController.abort();
+          console.log(`Tx not confirmed after ${TX_RETRY_INTERVAL * txSendAttempts++}ms, resending`);
+          sendTransaction();
+        }, TX_RETRY_INTERVAL);
+        pingAbortController.signal.addEventListener('abort', () => {
+          clearInterval(sendRetryInterval);
+          sendAbortController.abort();
+        });
+        txStart = Date.now();
+        sendTransaction();
+        await mConfirmRecentSignature({
+          abortSignal: pingAbortController.signal,
+          commitment: COMMITMENT_LEVEL,
+          signature,
+        });
+        console.log(`Confirmed tx ${signature}`);
       } catch (e) {
         // Log and loop if we get a bad blockhash.
         if (isSolanaError(e, SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND)) {
@@ -207,12 +174,14 @@ async function pingThing() {
           console.log(`ERROR: ${e.name}`);
           console.log(e.message);
           console.log(e);
-          console.log(JSON.stringify(e));
+          console.log(safeJSONStringify(e));
           continue;
         }
 
         // Need to submit a fake signature to pass the import filters
         signature = FAKE_SIGNATURE;
+      } finally {
+        pingAbortController.abort();
       }
 
       const txEnd = Date.now();
@@ -220,7 +189,7 @@ async function pingThing() {
       await sleep(SLEEP_MS_RPC);
       if (signature !== FAKE_SIGNATURE) {
         // Capture the slotLanded
-        let txLanded = await connection
+        let txLanded = await rpc
           .getTransaction(signature, {
             commitment: COMMITMENT_LEVEL,
             maxSupportedTransactionVersion: 255,
@@ -246,7 +215,7 @@ async function pingThing() {
       }
 
       // prepare the payload to send to validators.app
-      const vAPayload = JSON.stringify({
+      const vAPayload = safeJSONStringify({
         time: txEnd - txStart,
         signature,
         transaction_type: "transfer",
@@ -279,9 +248,8 @@ async function pingThing() {
 
         if (VERBOSE_LOG) {
           console.log(
-            `VA Response ${
-              vaResponse.status
-            } ${JSON.stringify(vaResponse.data)}`
+            `VA Response ${vaResponse.status
+            } ${safeJSONStringify(vaResponse.data)}`
           );
         }
       }
@@ -296,8 +264,4 @@ async function pingThing() {
   }
 }
 
-await Promise.all([
-  watchBlockhash(gBlockhash, connection),
-  watchSlotSent(gSlotSent, rpcSubscriptions),
-  pingThing(),
-]);
+await pingThing();
