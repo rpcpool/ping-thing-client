@@ -24,6 +24,7 @@ import { getNextSlot } from "./utils/slot.mjs";
 import { setMaxListeners } from "events";
 import axios from "axios";
 import { createRecentSignatureConfirmationPromiseFactory } from "@solana/transaction-confirmation";
+import { safeRace } from '@solana/promises';
 
 dotenv.config();
 
@@ -118,9 +119,13 @@ async function pingThing() {
 
         console.log(`Sending ${signature}`);
 
+        let rejectSendLoop;
+        const sendLoopPromise = new Promise((_, reject) => {
+          rejectSendLoop = reject;
+        });
         let sendAbortController;
         function sendTransaction() {
-          sendAbortController = new AbortController()
+          sendAbortController = new AbortController();
           mSendTransactionWithoutConfirming(transactionSignedWithFeePayer, {
             abortSignal: sendAbortController.signal,
             commitment: COMMITMENT_LEVEL,
@@ -130,7 +135,7 @@ async function pingThing() {
             if (e instanceof Error && e.name === 'AbortError') {
               return;
             } else {
-              throw e;
+              rejectSendLoop(e);
             }
           });
         }
@@ -146,11 +151,14 @@ async function pingThing() {
         });
         txStart = Date.now();
         sendTransaction();
-        await mConfirmRecentSignature({
-          abortSignal: pingAbortController.signal,
-          commitment: COMMITMENT_LEVEL,
-          signature,
-        });
+        await safeRace([
+          mConfirmRecentSignature({
+            abortSignal: pingAbortController.signal,
+            commitment: COMMITMENT_LEVEL,
+            signature,
+          }),
+          sendLoopPromise,
+        ]);
         console.log(`Confirmed tx ${signature}`);
       } catch (e) {
         // Log and loop if we get a bad blockhash.
