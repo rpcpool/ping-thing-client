@@ -11,6 +11,7 @@ import {
   isSolanaError,
   getSignatureFromTransaction,
   sendTransactionWithoutConfirmingFactory,
+  SOLANA_ERROR__BLOCK_HEIGHT_EXCEEDED,
   // Address,
 } from "@solana/web3.js";
 import dotenv from "dotenv";
@@ -23,7 +24,7 @@ import { rpc, rpcSubscriptions } from "./utils/rpc.mjs";
 import { getNextSlot } from "./utils/slot.mjs";
 import { setMaxListeners } from "events";
 import axios from "axios";
-import { createRecentSignatureConfirmationPromiseFactory } from "@solana/transaction-confirmation";
+import { createBlockHeightExceedencePromiseFactory, createRecentSignatureConfirmationPromiseFactory } from "@solana/transaction-confirmation";
 import { safeRace } from '@solana/promises';
 
 dotenv.config();
@@ -60,6 +61,10 @@ const TX_RETRY_INTERVAL = 2000;
 setMaxListeners(100);
 
 const mConfirmRecentSignature = createRecentSignatureConfirmationPromiseFactory({
+  rpc,
+  rpcSubscriptions,
+});
+const mThrowOnBlockheightExceedence = createBlockHeightExceedencePromiseFactory({
   rpc,
   rpcSubscriptions,
 });
@@ -157,6 +162,11 @@ async function pingThing() {
             commitment: COMMITMENT_LEVEL,
             signature,
           }),
+          mThrowOnBlockheightExceedence({
+            abortSignal: pingAbortController.signal,
+            commitment: COMMITMENT_LEVEL,
+            lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+          }),
           sendLoopPromise,
         ]);
         console.log(`Confirmed tx ${signature}`);
@@ -170,7 +180,7 @@ async function pingThing() {
 
         // If the transaction expired on the chain. Make a log entry and send
         // to VA. Otherwise log and loop.
-        if (e.name === "TransactionExpiredBlockheightExceededError") {
+        if (isSolanaError(e, SOLANA_ERROR__BLOCK_HEIGHT_EXCEEDED)) {
           console.log(
             `ERROR: Blockhash expired/block height exceeded. TX failure sent to VA.`
           );
