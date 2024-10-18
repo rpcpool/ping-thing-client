@@ -101,6 +101,8 @@ async function pingThing() {
         tx
       )
   );
+  console.log("ONE");
+
   while (true) {
     await sleep(SLEEP_MS_LOOP);
 
@@ -113,7 +115,9 @@ async function pingThing() {
     try {
       const pingAbortController = new AbortController();
       try {
+        console.log("TWO");
         const latestBlockhash = await getLatestBlockhash();
+        console.log("THREE");
         const transactionMessage = setTransactionMessageLifetimeUsingBlockhash(
           latestBlockhash,
           BASE_TRANSACTION_MESSAGE
@@ -125,18 +129,22 @@ async function pingThing() {
         console.log(`Sending ${signature}`);
 
         let rejectSendLoop;
+        console.log("FOUR");
         const sendLoopPromise = new Promise((_, reject) => {
           rejectSendLoop = reject;
         });
+        console.log("FIVE");
         let sendAbortController;
         function sendTransaction() {
           sendAbortController = new AbortController();
+          console.log("SIX");
           mSendTransactionWithoutConfirming(transactionSignedWithFeePayer, {
             abortSignal: sendAbortController.signal,
             commitment: COMMITMENT_LEVEL,
             maxRetries: 0n,
             skipPreflight: true,
           }).catch(e => {
+            console.log("SEVEN");
             if (e instanceof Error && e.name === 'AbortError') {
               return;
             } else {
@@ -144,18 +152,25 @@ async function pingThing() {
             }
           });
         }
+        console.log("EIGHT");
         slotSent = await getNextSlot();
+        console.log("NINE");
         const sendRetryInterval = setInterval(() => {
           sendAbortController.abort();
+          console.log("TEN");
           console.log(`Tx not confirmed after ${TX_RETRY_INTERVAL * txSendAttempts++}ms, resending`);
           sendTransaction();
         }, TX_RETRY_INTERVAL);
+        console.log("ELEVEN");
         pingAbortController.signal.addEventListener('abort', () => {
+          console.log("TWELVE");
           clearInterval(sendRetryInterval);
           sendAbortController.abort();
         });
+        console.log("THIRTEEN");
         txStart = Date.now();
         sendTransaction();
+        console.log("FOURTEEN");
         await safeRace([
           mConfirmRecentSignature({
             abortSignal: pingAbortController.signal,
@@ -169,8 +184,10 @@ async function pingThing() {
           }),
           sendLoopPromise,
         ]);
+        console.log("FIFTEEN");
         console.log(`Confirmed tx ${signature}`);
       } catch (e) {
+        console.log("SIXTEEN");
         // Log and loop if we get a bad blockhash.
         if (isSolanaError(e, SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND)) {
         // if (e.message.includes("Blockhash not found")) {
@@ -195,12 +212,14 @@ async function pingThing() {
         // Need to submit a fake signature to pass the import filters
         signature = FAKE_SIGNATURE;
       } finally {
+        console.log("SEVENTEEN");
         pingAbortController.abort();
       }
 
       const txEnd = Date.now();
       // Sleep a little here to ensure the signature is on an RPC node.
       await sleep(SLEEP_MS_RPC);
+      console.log("EIGHTEEN");
       if (signature !== FAKE_SIGNATURE) {
         // Capture the slotLanded
         let txLanded = await rpc
@@ -218,7 +237,7 @@ async function pingThing() {
         }
         slotLanded = txLanded.slot;
       }
-
+      console.log("NINETEEN");
       // Don't send if the slot latency is negative
       if (slotLanded < slotSent) {
         console.log(
@@ -227,7 +246,7 @@ async function pingThing() {
         );
         continue;
       }
-
+      console.log("TWENTY");
       // prepare the payload to send to validators.app
       const vAPayload = safeJSONStringify({
         time: txEnd - txStart,
@@ -245,6 +264,7 @@ async function pingThing() {
 
       if (!SKIP_VALIDATORS_APP) {
         // Send the payload to validators.app
+        console.log("TWENTY-ONE");
         const vaResponse = await axios.post(
           "https://www.validators.app/api/v1/ping-thing/mainnet",
           vAPayload,
@@ -259,7 +279,7 @@ async function pingThing() {
         if (!(vaResponse.status >= 200 && vaResponse.status <= 299)) {
           throw new Error(`Failed to update validators: ${vaResponse.status}`);
         }
-
+        console.log("TWENTY-TWO");
         if (VERBOSE_LOG) {
           console.log(
             `VA Response ${vaResponse.status
