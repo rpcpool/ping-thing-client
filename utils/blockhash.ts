@@ -1,6 +1,6 @@
 // This is a blockhash watcher. It constantly fetches new blockhash and updates a global variable
 
-import type { Blockhash, GetLatestBlockhashApi, Rpc, SolanaRpcApi } from "@solana/web3.js";
+import type { Blockhash, GetLatestBlockhashApi, Rpc, SolanaRpcApi } from "@solana/kit";
 import { sleep } from "./misc.js";
 import { safeRace } from "@solana/promises";
 
@@ -29,7 +29,7 @@ export const watchBlockhash = async (gBlockhash: { value: Blockhash | null, upda
       // fails to respond within 5 seconds, the promise will reject and the
       // script will log an error.
       const latestBlockhash = await safeRace([
-        connection.getLatestBlockhash().send(),
+        connection.getLatestBlockhash({commitment: "finalized"}).send(),
         timeoutPromise,
       ]) as ReturnType<GetLatestBlockhashApi['getLatestBlockhash']>;
 
