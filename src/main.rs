@@ -9,12 +9,15 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_message::Message;
+use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::Transaction;
 use solana_transaction_status::UiTransactionEncoding;
+use spl_memo_interface::{instruction as memo_instruction, v3 as memo_program};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
@@ -29,6 +32,73 @@ use utils::{
     slot::{watch_slot, GlobalSlotSent},
     subscription_manager::watch_transactions,
 };
+
+const USE_MEMO_IX_WITH_STRING_ENV_VAR: &str = "USE_MEMO_IX_WITH_STRING";
+
+fn memo_string_from_environment() -> Result<Option<String>> {
+    match std::env::var(USE_MEMO_IX_WITH_STRING_ENV_VAR) {
+        Ok(memo_string) if memo_string.is_empty() => Ok(None),
+        Ok(memo_string) => Ok(Some(memo_string)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
+            "{} must be valid UTF-8",
+            USE_MEMO_IX_WITH_STRING_ENV_VAR
+        )),
+    }
+}
+
+fn build_transaction_instructions(
+    wallet_pubkey: &Pubkey,
+    current_priority_fee: u64,
+    memo_string: Option<&str>,
+) -> Vec<Instruction> {
+    let mut instructions = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(20000),
+        ComputeBudgetInstruction::set_compute_unit_price(current_priority_fee),
+        system_instruction::transfer(wallet_pubkey, wallet_pubkey, 5000),
+    ];
+
+    if let Some(memo_string) = memo_string {
+        instructions.push(memo_instruction::build_memo(
+            &memo_program::id(),
+            memo_string.as_bytes(),
+            &[wallet_pubkey],
+        ));
+    }
+
+    instructions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_transaction_instructions_without_memo_keeps_existing_instruction_count() {
+        let wallet_pubkey = Pubkey::new_unique();
+        let instructions = build_transaction_instructions(&wallet_pubkey, 42, None);
+
+        assert_eq!(instructions.len(), 3);
+        assert!(!instructions
+            .iter()
+            .any(|instruction| instruction.program_id == memo_program::id()));
+    }
+
+    #[test]
+    fn build_transaction_instructions_appends_signed_memo_instruction() {
+        let wallet_pubkey = Pubkey::new_unique();
+        let memo_string = "ping thing memo";
+        let instructions = build_transaction_instructions(&wallet_pubkey, 42, Some(memo_string));
+
+        let memo_instruction = instructions.last().expect("memo instruction exists");
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(memo_instruction.program_id, memo_program::id());
+        assert_eq!(memo_instruction.data, memo_string.as_bytes());
+        assert_eq!(memo_instruction.accounts.len(), 1);
+        assert_eq!(memo_instruction.accounts[0].pubkey, wallet_pubkey);
+        assert!(memo_instruction.accounts[0].is_signer);
+    }
+}
 
 #[derive(Debug)]
 enum SendTransactionRequestError {
@@ -387,6 +457,17 @@ async fn main() -> Result<()> {
     let pinger_name = std::env::var("PINGER_NAME").unwrap_or_else(|_| "UNSET".to_string());
     info!("PINGER_NAME: {:?}", pinger_name);
 
+    let memo_string = memo_string_from_environment()?;
+    if let Some(memo_string_value) = &memo_string {
+        info!(
+            "{}: [SET, {} bytes]",
+            USE_MEMO_IX_WITH_STRING_ENV_VAR,
+            memo_string_value.len()
+        );
+    } else {
+        info!("{}: [NOT SET]", USE_MEMO_IX_WITH_STRING_ENV_VAR);
+    }
+
     let priority_fee_percentile = std::env::var("PRIORITY_FEE_PERCENTILE")
         .unwrap_or_else(|_| "5000".to_string())
         .parse::<u16>()
@@ -615,11 +696,11 @@ async fn main() -> Result<()> {
         };
 
         // Build transaction instructions
-        let instructions = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(500),
-            ComputeBudgetInstruction::set_compute_unit_price(current_priority_fee),
-            system_instruction::transfer(&wallet_keypair.pubkey(), &wallet_keypair.pubkey(), 5000),
-        ];
+        let instructions = build_transaction_instructions(
+            &wallet_keypair.pubkey(),
+            current_priority_fee,
+            memo_string.as_deref(),
+        );
 
         // Create and sign transaction
         let message =
