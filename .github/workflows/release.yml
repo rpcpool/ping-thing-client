@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  trigger-build:
+    runs-on: self-hosted
+    steps:
+      - name: Generate App Token
+        id: generate_token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        with:
+          app-id: ${{ secrets.TRIGGER_APP_ID }}
+          private-key: ${{ secrets.TRIGGER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: Binaries-ci
+
+      - name: Trigger Build
+        run: |
+          gh workflow run build-release.yml \
+            --repo ${{ github.repository_owner }}/Binaries-ci \
+            --ref main \
+            -f org=${{ github.repository_owner }} \
+            -f repo=${{ github.event.repository.name }} \
+            -f tag=${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
