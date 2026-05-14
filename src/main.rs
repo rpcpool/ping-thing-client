@@ -50,10 +50,11 @@ fn memo_string_from_environment() -> Result<Option<String>> {
 fn build_transaction_instructions(
     wallet_pubkey: &Pubkey,
     current_priority_fee: u64,
+    cu_budget: u32,
     memo_string: Option<&str>,
 ) -> Vec<Instruction> {
     let mut instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(20000),
+        ComputeBudgetInstruction::set_compute_unit_limit(cu_budget),
         ComputeBudgetInstruction::set_compute_unit_price(current_priority_fee),
         system_instruction::transfer(wallet_pubkey, wallet_pubkey, 5000),
     ];
@@ -76,7 +77,7 @@ mod tests {
     #[test]
     fn build_transaction_instructions_without_memo_keeps_existing_instruction_count() {
         let wallet_pubkey = Pubkey::new_unique();
-        let instructions = build_transaction_instructions(&wallet_pubkey, 42, None);
+        let instructions = build_transaction_instructions(&wallet_pubkey, 42, 500, None);
 
         assert_eq!(instructions.len(), 3);
         assert!(!instructions
@@ -88,7 +89,7 @@ mod tests {
     fn build_transaction_instructions_appends_signed_memo_instruction() {
         let wallet_pubkey = Pubkey::new_unique();
         let memo_string = "ping thing memo";
-        let instructions = build_transaction_instructions(&wallet_pubkey, 42, Some(memo_string));
+        let instructions = build_transaction_instructions(&wallet_pubkey, 42, 20000, Some(memo_string));
 
         let memo_instruction = instructions.last().expect("memo instruction exists");
         assert_eq!(instructions.len(), 4);
@@ -468,6 +469,12 @@ async fn main() -> Result<()> {
         info!("{}: [NOT SET]", USE_MEMO_IX_WITH_STRING_ENV_VAR);
     }
 
+    let cu_budget = std::env::var("CU_BUDGET")
+        .unwrap_or_else(|_| "500".to_string())
+        .parse::<u32>()
+        .unwrap_or(500);
+    info!("CU_BUDGET: {:?}", cu_budget);
+
     let priority_fee_percentile = std::env::var("PRIORITY_FEE_PERCENTILE")
         .unwrap_or_else(|_| "5000".to_string())
         .parse::<u16>()
@@ -699,6 +706,7 @@ async fn main() -> Result<()> {
         let instructions = build_transaction_instructions(
             &wallet_keypair.pubkey(),
             current_priority_fee,
+            cu_budget,
             memo_string.as_deref(),
         );
 
