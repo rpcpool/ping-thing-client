@@ -3,6 +3,10 @@ name = "ping-thing-client-rust"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "ping-thing-client"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1.48.0", features = ["full"] }
 solana-compute-budget = "3.0.10"
