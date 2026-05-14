@@ -5,7 +5,7 @@ use std::sync::Arc;
 use warp::Filter;
 
 pub struct Metrics {
-    pub registry: Registry,
+    pub registry: Arc<Registry>,
     pub confirmation_latency: HistogramVec,
     pub slot_latency: HistogramVec,
 }
@@ -13,7 +13,7 @@ pub struct Metrics {
 impl Metrics {
     pub fn new() -> Result<Self> {
         info!("[Metrics] Initializing Prometheus metrics registry...");
-        let registry = Registry::new();
+        let registry = Arc::new(Registry::new());
 
         info!("[Metrics] Creating histogram buckets for confirmation latency...");
         // Generate millisecond buckets
@@ -76,7 +76,7 @@ impl Metrics {
             "[Metrics] Starting Prometheus metrics server on port {:?}...",
             port
         );
-        let metrics = Arc::new(self.registry.clone());
+        let metrics = Arc::clone(&self.registry);
 
         let metrics_route = warp::path!("metrics").map(move || {
             debug!("[Metrics] Handling /metrics request");
@@ -92,5 +92,25 @@ impl Metrics {
             port
         );
         warp::serve(metrics_route).run(([0, 0, 0, 0], port)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gathered_metrics_are_exposed_from_shared_registry() {
+        let metrics = Metrics::new().unwrap();
+        let mut buffer = Vec::new();
+        let encoder = prometheus::TextEncoder::new();
+
+        encoder
+            .encode(&metrics.registry.gather(), &mut buffer)
+            .unwrap();
+
+        let rendered = String::from_utf8(buffer).unwrap();
+        assert!(rendered.contains("ping_thing_client_confirmation_latency"));
+        assert!(rendered.contains("ping_thing_client_slot_latency"));
     }
 }

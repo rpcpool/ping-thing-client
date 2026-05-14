@@ -58,38 +58,33 @@ pub async fn watch_transactions(
     while let Some(message) = stream.next().await {
         match message {
             Ok(msg) => {
-                if let Some(update) = msg.update_oneof {
-                    match update {
-                        UpdateOneof::Transaction(tx_update) => {
-                            if let Some(transaction) = tx_update.transaction {
-                                let tx_signature =
-                                    bs58::encode(&transaction.signature).into_string();
-                                let slot_landed = tx_update.slot;
-                                let confirmed = transaction
-                                    .meta
-                                    .as_ref()
-                                    .is_some_and(|meta| meta.err.is_none());
+                if let Some(UpdateOneof::Transaction(tx_update)) = msg.update_oneof {
+                    if let Some(transaction) = tx_update.transaction {
+                        let tx_signature = bs58::encode(&transaction.signature).into_string();
+                        let slot_landed = tx_update.slot;
+                        let confirmed = transaction
+                            .meta
+                            .as_ref()
+                            .is_some_and(|meta| meta.err.is_none());
 
-                                info!(
-                                        "[Transaction Watcher] Transaction update - Signature: {:?}, Slot: {:?}, Confirmed: {:?}",
-                                        tx_signature, slot_landed, confirmed
-                                    );
+                        info!(
+                            "[Transaction Watcher] Transaction update - Signature: {:?}, Slot: {:?}, Confirmed: {:?}",
+                            tx_signature, slot_landed, confirmed
+                        );
 
-                                let transaction_signature_for_channel_send =
-                                    tx_signature.clone();
-                                if let Err(e) = tx_updates_tx
-                                    .send((transaction_signature_for_channel_send, slot_landed, confirmed))
-                                    .await
-                                {
-                                    error!(
-                                            "[Transaction Watcher] Failed to send transaction update for signature {:?}, slot {:?}, confirmed {:?}: {:?}",
-                                            tx_signature, slot_landed, confirmed, e
-                                        );
-                                }
-                            }
-                        }
-                        _ => {
-                            // Ignore other update types
+                        let transaction_signature_for_channel_send = tx_signature.clone();
+                        if let Err(e) = tx_updates_tx
+                            .send((
+                                transaction_signature_for_channel_send,
+                                slot_landed,
+                                confirmed,
+                            ))
+                            .await
+                        {
+                            error!(
+                                "[Transaction Watcher] Failed to send transaction update for signature {:?}, slot {:?}, confirmed {:?}: {:?}",
+                                tx_signature, slot_landed, confirmed, e
+                            );
                         }
                     }
                 }
