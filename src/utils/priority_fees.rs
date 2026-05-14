@@ -115,7 +115,8 @@ pub async fn watch_prioritization_fees(
                 } else {
                     error!(
                         "[Priority Fees Watcher] RPC request to {:?} failed with status: {:?}",
-                        rpc_endpoint, response.status()
+                        rpc_endpoint,
+                        response.status()
                     );
                 }
             }

@@ -61,62 +61,52 @@ pub async fn watch_blockhash(
         while let Some(message) = stream.next().await {
             match message {
                 Ok(msg) => {
-                    if let Some(update) = msg.update_oneof {
-                        match update {
-                            UpdateOneof::BlockMeta(block_meta_update) => {
-                                let blockhash_str = block_meta_update.blockhash;
-                                let block_height = block_meta_update
-                                    .block_height
-                                    .map(|bh| bh.block_height)
-                                    .unwrap_or(0);
+                    if let Some(UpdateOneof::BlockMeta(block_meta_update)) = msg.update_oneof {
+                        let blockhash_str = block_meta_update.blockhash;
+                        let block_height = block_meta_update
+                            .block_height
+                            .map(|bh| bh.block_height)
+                            .unwrap_or(0);
 
-                                // Parse blockhash from base58 string
-                                let hash_bytes = match bs58::decode(&blockhash_str).into_vec() {
-                                    Ok(decoded) => {
-                                        if decoded.len() == 32 {
-                                            match <[u8; 32]>::try_from(decoded.as_slice()) {
-                                                Ok(arr) => arr,
-                                                Err(_) => {
-                                                    error!(
-                                                        "[Blockhash Watcher] Failed to convert decoded blockhash to array for blockhash {:?} with length {:?}",
-                                                        blockhash_str, decoded.len()
-                                                    );
-                                                    continue;
-                                                }
-                                            }
-                                        } else {
+                        // Parse blockhash from base58 string
+                        let hash_bytes = match bs58::decode(&blockhash_str).into_vec() {
+                            Ok(decoded) => {
+                                if decoded.len() == 32 {
+                                    match <[u8; 32]>::try_from(decoded.as_slice()) {
+                                        Ok(arr) => arr,
+                                        Err(_) => {
                                             error!(
-                                                "[Blockhash Watcher] Decoded blockhash has wrong length: {:?} (expected 32)",
-                                                decoded.len()
+                                                "[Blockhash Watcher] Failed to convert decoded blockhash to array for blockhash {:?} with length {:?}",
+                                                blockhash_str, decoded.len()
                                             );
                                             continue;
                                         }
                                     }
-                                    Err(e) => {
-                                        error!(
-                                            "[Blockhash Watcher] Failed to decode blockhash: {:?}",
-                                            e
-                                        );
-                                        continue;
-                                    }
-                                };
-
-                                let new_hash = Hash::new_from_array(hash_bytes);
-
-                                // Update global blockhash if different
-                                let mut g = g_blockhash.lock().await;
-                                let previous_hash = g.value;
-
-                                if previous_hash != Some(new_hash) {
-                                    g.value = Some(new_hash);
-                                    g.last_valid_block_height = block_height;
-                                    g.updated_at = chrono::Utc::now().timestamp();
-                                    drop(g);
+                                } else {
+                                    error!(
+                                        "[Blockhash Watcher] Decoded blockhash has wrong length: {:?} (expected 32)",
+                                        decoded.len()
+                                    );
+                                    continue;
                                 }
                             }
-                            _ => {
-                                // Ignore other update types
+                            Err(e) => {
+                                error!("[Blockhash Watcher] Failed to decode blockhash: {:?}", e);
+                                continue;
                             }
+                        };
+
+                        let new_hash = Hash::new_from_array(hash_bytes);
+
+                        // Update global blockhash if different
+                        let mut g = g_blockhash.lock().await;
+                        let previous_hash = g.value;
+
+                        if previous_hash != Some(new_hash) {
+                            g.value = Some(new_hash);
+                            g.last_valid_block_height = block_height;
+                            g.updated_at = chrono::Utc::now().timestamp();
+                            drop(g);
                         }
                     }
                 }

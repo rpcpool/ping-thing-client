@@ -89,7 +89,8 @@ mod tests {
     fn build_transaction_instructions_appends_signed_memo_instruction() {
         let wallet_pubkey = Pubkey::new_unique();
         let memo_string = "ping thing memo";
-        let instructions = build_transaction_instructions(&wallet_pubkey, 42, 20000, Some(memo_string));
+        let instructions =
+            build_transaction_instructions(&wallet_pubkey, 42, 20000, Some(memo_string));
 
         let memo_instruction = instructions.last().expect("memo instruction exists");
         assert_eq!(instructions.len(), 4);
@@ -103,7 +104,9 @@ mod tests {
 
 #[derive(Debug)]
 enum SendTransactionRequestError {
-    TransactionSerializationFailed { reason: String },
+    TransactionSerializationFailed {
+        reason: String,
+    },
     SendTransactionRequestFailed {
         endpoint: String,
         send_transaction_request_error: reqwest::Error,
@@ -127,7 +130,10 @@ enum SendTransactionRequestError {
         code: i64,
         message: String,
     },
-    SendTransactionResponseMissingSignature { endpoint: String, response_body: String },
+    SendTransactionResponseMissingSignature {
+        endpoint: String,
+        response_body: String,
+    },
     SendTransactionResponseSignatureMismatch {
         endpoint: String,
         expected_signature: String,
@@ -261,23 +267,24 @@ async fn send_transaction_using_configured_send_transaction_endpoint_or_rpc_clie
             .json(&request_body)
             .send()
             .await
-            .map_err(
-                |send_transaction_request_error| SendTransactionRequestError::SendTransactionRequestFailed {
+            .map_err(|send_transaction_request_error| {
+                SendTransactionRequestError::SendTransactionRequestFailed {
                     endpoint: send_transaction_endpoint_value.to_string(),
                     send_transaction_request_error,
-                },
-            )?;
+                }
+            })?;
 
         let response_status = response.status();
-        let response_body = response
-            .text()
-            .await
-            .map_err(
-                |send_transaction_response_read_error| SendTransactionRequestError::SendTransactionResponseReadFailed {
-                    endpoint: send_transaction_endpoint_value.to_string(),
-                    send_transaction_response_read_error,
-                },
-            )?;
+        let response_body =
+            response
+                .text()
+                .await
+                .map_err(|send_transaction_response_read_error| {
+                    SendTransactionRequestError::SendTransactionResponseReadFailed {
+                        endpoint: send_transaction_endpoint_value.to_string(),
+                        send_transaction_response_read_error,
+                    }
+                })?;
 
         if !response_status.is_success() {
             return Err(
@@ -307,11 +314,13 @@ async fn send_transaction_using_configured_send_transaction_endpoint_or_rpc_clie
                 .and_then(|value| value.as_str())
                 .unwrap_or("Unknown RPC error")
                 .to_string();
-            return Err(SendTransactionRequestError::SendTransactionResponseRpcError {
-                endpoint: send_transaction_endpoint_value.to_string(),
-                code: error_code,
-                message: error_message,
-            });
+            return Err(
+                SendTransactionRequestError::SendTransactionResponseRpcError {
+                    endpoint: send_transaction_endpoint_value.to_string(),
+                    code: error_code,
+                    message: error_message,
+                },
+            );
         }
 
         let response_signature = response_value
@@ -341,11 +350,11 @@ async fn send_transaction_using_configured_send_transaction_endpoint_or_rpc_clie
             .send_transaction_with_config(transaction, send_transaction_config)
             .await
             .map(|_| ())
-            .map_err(
-                |rpc_client_send_transaction_error| SendTransactionRequestError::RpcClientSendTransactionFailed {
+            .map_err(|rpc_client_send_transaction_error| {
+                SendTransactionRequestError::RpcClientSendTransactionFailed {
                     rpc_client_send_transaction_error,
-                },
-            )
+                }
+            })
     }
 }
 
@@ -619,7 +628,10 @@ async fn main() -> Result<()> {
 
     loop {
         if sleep_ms_loop > 0 {
-            info!("Sleeping {:?}ms before next transaction cycle", sleep_ms_loop);
+            info!(
+                "Sleeping {:?}ms before next transaction cycle",
+                sleep_ms_loop
+            );
             sleep_ms(sleep_ms_loop).await;
         }
 
@@ -797,7 +809,10 @@ async fn main() -> Result<()> {
         loop {
             // Check if timeout elapsed
             if start_time.elapsed() >= timeout_duration {
-                warn!("[TX] Transaction {:?} timed out after 20 seconds", signature);
+                warn!(
+                    "[TX] Transaction {:?} timed out after 20 seconds",
+                    signature
+                );
                 break;
             }
 
@@ -807,7 +822,10 @@ async fn main() -> Result<()> {
                     // Received a confirmation notification
                     if conf_signature == signature {
                         // This is the confirmation for our current transaction
-                        info!("[TX] Confirmation received for transaction: {:?}", signature);
+                        info!(
+                            "[TX] Confirmation received for transaction: {:?}",
+                            signature
+                        );
                         confirmed = true;
                         slot_landed = conf_slot_landed;
                         is_success = conf_success;
@@ -847,7 +865,8 @@ async fn main() -> Result<()> {
                         Ok(_) => {
                             debug!("[TX] Successfully resent transaction");
                         }
-                        Err(send_transaction_request_error) => match &send_transaction_request_error {
+                        Err(send_transaction_request_error) => match &send_transaction_request_error
+                        {
                             SendTransactionRequestError::SendTransactionRequestFailed {
                                 endpoint,
                                 send_transaction_request_error,
