@@ -105,6 +105,15 @@ mod tests {
         let mut buffer = Vec::new();
         let encoder = prometheus::TextEncoder::new();
 
+        metrics
+            .confirmation_latency
+            .with_label_values(&["test-pinger"])
+            .observe(1.0);
+        metrics
+            .slot_latency
+            .with_label_values(&["test-pinger"])
+            .observe(1.0);
+
         encoder
             .encode(&metrics.registry.gather(), &mut buffer)
             .unwrap();
