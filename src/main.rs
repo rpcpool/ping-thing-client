@@ -269,7 +269,7 @@ fn configured_send_transaction_endpoint_from_environment(
 
     let response_signature = std::env::var("SEND_TX_RESPONSE_SIGNATURE")
         .map(|value| value.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let forwarding_policies = std::env::var("SEND_TX_FORWARDING_POLICIES")
         .map(|value| {
@@ -408,6 +408,7 @@ async fn send_transaction_using_triton_sendtx_endpoint(
     send_transaction_http_client: &Client,
     transaction: &Transaction,
 ) -> Result<(), SendTransactionRequestError> {
+    let expected_signature = transaction.signatures[0].to_string();
     let serialized_transaction_bytes = serialized_transaction_bytes(transaction)?;
     let mut request = send_transaction_http_client.post(&send_transaction_endpoint.endpoint);
 
@@ -459,11 +460,15 @@ async fn send_transaction_using_triton_sendtx_endpoint(
     if send_transaction_endpoint.response_signature {
         let response_signature =
             signature_from_sendtx_response(&send_transaction_endpoint.endpoint, &response_body)?;
-        validate_response_signature(
-            &send_transaction_endpoint.endpoint,
-            transaction,
-            &response_signature,
-        )?;
+        if response_signature != expected_signature {
+            return Err(
+                SendTransactionRequestError::SendTransactionResponseSignatureMismatch {
+                    endpoint: send_transaction_endpoint.endpoint.clone(),
+                    expected_signature,
+                    actual_signature: response_signature,
+                },
+            );
+        }
     }
 
     Ok(())
