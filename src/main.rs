@@ -282,6 +282,13 @@ fn configured_send_transaction_endpoint_from_environment(
         })
         .unwrap_or_default();
 
+    let endpoint = match kind {
+        SendTransactionEndpointKind::TritonSendTx if !endpoint.ends_with("/sendtx") => {
+            format!("{}/sendtx", endpoint.trim_end_matches('/'))
+        }
+        _ => endpoint,
+    };
+
     Ok(Some(ConfiguredSendTransactionEndpoint {
         endpoint,
         kind,
