@@ -30,6 +30,29 @@ use utils::{
     subscription_manager::watch_transactions,
 };
 
+#[derive(Debug, Clone)]
+struct ConfiguredSendTransactionEndpoint {
+    endpoint: String,
+    kind: SendTransactionEndpointKind,
+    encoding: TritonSendTxEncoding,
+    max_retries: Option<u32>,
+    response_signature: bool,
+    forwarding_policies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendTransactionEndpointKind {
+    JsonRpc,
+    TritonSendTx,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TritonSendTxEncoding {
+    Raw,
+    Base58,
+    Base64,
+}
+
 #[derive(Debug)]
 enum SendTransactionRequestError {
     TransactionSerializationFailed { reason: String },
@@ -160,122 +183,388 @@ impl fmt::Display for SendTransactionRequestError {
 
 impl std::error::Error for SendTransactionRequestError {}
 
+fn configured_send_transaction_endpoint_from_environment(
+) -> Result<Option<ConfiguredSendTransactionEndpoint>> {
+    let Some(endpoint) = std::env::var("SEND_TX_ENDPOINT").ok() else {
+        return Ok(None);
+    };
+
+    let kind = match std::env::var("SEND_TX_KIND")
+        .or_else(|_| std::env::var("TRANSACTION_SEND_KIND"))
+        .unwrap_or_else(|_| "json_rpc".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "json_rpc" | "jsonrpc" => SendTransactionEndpointKind::JsonRpc,
+        "sendtx" | "send_tx" | "triton_sendtx" | "triton_send_tx" => {
+            SendTransactionEndpointKind::TritonSendTx
+        }
+        "rpc" => {
+            anyhow::bail!("SEND_TX_KIND=rpc is invalid when SEND_TX_ENDPOINT is set");
+        }
+        other => anyhow::bail!("invalid SEND_TX_KIND: {}", other),
+    };
+
+    let encoding = match std::env::var("SEND_TX_ENCODING")
+        .unwrap_or_else(|_| "raw".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "raw" => TritonSendTxEncoding::Raw,
+        "base58" => TritonSendTxEncoding::Base58,
+        "base64" => TritonSendTxEncoding::Base64,
+        other => anyhow::bail!("invalid SEND_TX_ENCODING: {}", other),
+    };
+
+    let max_retries = std::env::var("SEND_TX_MAX_RETRIES")
+        .ok()
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid SEND_TX_MAX_RETRIES: {}", error))?;
+
+    let response_signature = std::env::var("SEND_TX_RESPONSE_SIGNATURE")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+
+    let forwarding_policies = std::env::var("SEND_TX_FORWARDING_POLICIES")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Some(ConfiguredSendTransactionEndpoint {
+        endpoint,
+        kind,
+        encoding,
+        max_retries,
+        response_signature,
+        forwarding_policies,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sendtx_plain_signature_response_is_parsed() {
+        let signature = "5h6JYJ57QvpPvhAkZML12MS2EUp6vbrZEn7zR1pC3skD";
+        assert_eq!(
+            signature_from_sendtx_response("http://sendtx", signature).unwrap(),
+            signature
+        );
+    }
+
+    #[test]
+    fn sendtx_json_signature_response_is_parsed() {
+        let signature = "5h6JYJ57QvpPvhAkZML12MS2EUp6vbrZEn7zR1pC3skD";
+        let response_body = format!(r#"{{"signature":"{}"}}"#, signature);
+        assert_eq!(
+            signature_from_sendtx_response("http://sendtx", &response_body).unwrap(),
+            signature
+        );
+    }
+}
+
 async fn send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
-    send_transaction_endpoint: Option<&str>,
+    send_transaction_endpoint: Option<&ConfiguredSendTransactionEndpoint>,
     send_transaction_http_client: &Client,
     rpc_client: &RpcClient,
     transaction: &Transaction,
     send_transaction_config: RpcSendTransactionConfig,
 ) -> Result<(), SendTransactionRequestError> {
-    if let Some(send_transaction_endpoint_value) = send_transaction_endpoint {
-        let serialized_transaction_bytes = bincode::serialize(transaction).map_err(|error| {
-            SendTransactionRequestError::TransactionSerializationFailed {
-                reason: error.to_string(),
-            }
-        })?;
-        let serialized_transaction_base64 = BASE64_STANDARD.encode(serialized_transaction_bytes);
-        let mut adjusted_send_transaction_config = send_transaction_config;
-        if adjusted_send_transaction_config.encoding.is_none() {
-            adjusted_send_transaction_config.encoding = Some(UiTransactionEncoding::Base64);
-        }
-        let request_body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendTransaction",
-            "params": [serialized_transaction_base64, adjusted_send_transaction_config],
-        });
-
-        let response = send_transaction_http_client
-            .post(send_transaction_endpoint_value)
-            .json(&request_body)
-            .send()
+    match send_transaction_endpoint {
+        Some(send_transaction_endpoint_value)
+            if send_transaction_endpoint_value.kind == SendTransactionEndpointKind::JsonRpc =>
+        {
+            send_transaction_using_json_rpc_endpoint(
+                send_transaction_endpoint_value,
+                send_transaction_http_client,
+                transaction,
+                send_transaction_config,
+            )
             .await
-            .map_err(
-                |send_transaction_request_error| SendTransactionRequestError::SendTransactionRequestFailed {
-                    endpoint: send_transaction_endpoint_value.to_string(),
-                    send_transaction_request_error,
-                },
-            )?;
-
-        let response_status = response.status();
-        let response_body = response
-            .text()
+        }
+        Some(send_transaction_endpoint_value)
+            if send_transaction_endpoint_value.kind
+                == SendTransactionEndpointKind::TritonSendTx =>
+        {
+            send_transaction_using_triton_sendtx_endpoint(
+                send_transaction_endpoint_value,
+                send_transaction_http_client,
+                transaction,
+            )
             .await
-            .map_err(
-                |send_transaction_response_read_error| SendTransactionRequestError::SendTransactionResponseReadFailed {
-                    endpoint: send_transaction_endpoint_value.to_string(),
-                    send_transaction_response_read_error,
-                },
-            )?;
-
-        if !response_status.is_success() {
-            return Err(
-                SendTransactionRequestError::SendTransactionRequestNonSuccessStatus {
-                    endpoint: send_transaction_endpoint_value.to_string(),
-                    status_code: response_status.as_u16(),
-                    response_body,
-                },
-            );
         }
-
-        let response_value: Value = serde_json::from_str(&response_body).map_err(|error| {
-            SendTransactionRequestError::SendTransactionResponseInvalidJson {
-                endpoint: send_transaction_endpoint_value.to_string(),
-                response_body: response_body.clone(),
-                reason: error.to_string(),
-            }
-        })?;
-
-        if let Some(error_value) = response_value.get("error") {
-            let error_code = error_value
-                .get("code")
-                .and_then(|value| value.as_i64())
-                .unwrap_or(0);
-            let error_message = error_value
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Unknown RPC error")
-                .to_string();
-            return Err(SendTransactionRequestError::SendTransactionResponseRpcError {
-                endpoint: send_transaction_endpoint_value.to_string(),
-                code: error_code,
-                message: error_message,
-            });
-        }
-
-        let response_signature = response_value
-            .get("result")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                SendTransactionRequestError::SendTransactionResponseMissingSignature {
-                    endpoint: send_transaction_endpoint_value.to_string(),
-                    response_body: response_body.clone(),
-                }
-            })?;
-
-        let expected_signature = transaction.signatures[0].to_string();
-        if response_signature != expected_signature {
-            return Err(
-                SendTransactionRequestError::SendTransactionResponseSignatureMismatch {
-                    endpoint: send_transaction_endpoint_value.to_string(),
-                    expected_signature,
-                    actual_signature: response_signature.to_string(),
-                },
-            );
-        }
-
-        Ok(())
-    } else {
-        rpc_client
+        Some(_) => unreachable!("all send transaction endpoint kinds are handled"),
+        None => rpc_client
             .send_transaction_with_config(transaction, send_transaction_config)
             .await
             .map(|_| ())
-            .map_err(
-                |rpc_client_send_transaction_error| SendTransactionRequestError::RpcClientSendTransactionFailed {
+            .map_err(|rpc_client_send_transaction_error| {
+                SendTransactionRequestError::RpcClientSendTransactionFailed {
                     rpc_client_send_transaction_error,
-                },
-            )
+                }
+            }),
     }
+}
+
+async fn send_transaction_using_json_rpc_endpoint(
+    send_transaction_endpoint: &ConfiguredSendTransactionEndpoint,
+    send_transaction_http_client: &Client,
+    transaction: &Transaction,
+    send_transaction_config: RpcSendTransactionConfig,
+) -> Result<(), SendTransactionRequestError> {
+    let serialized_transaction_base64 =
+        BASE64_STANDARD.encode(serialized_transaction_bytes(transaction)?);
+    let mut adjusted_send_transaction_config = send_transaction_config;
+    if adjusted_send_transaction_config.encoding.is_none() {
+        adjusted_send_transaction_config.encoding = Some(UiTransactionEncoding::Base64);
+    }
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [serialized_transaction_base64, adjusted_send_transaction_config],
+    });
+
+    let response = send_transaction_http_client
+        .post(&send_transaction_endpoint.endpoint)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|send_transaction_request_error| {
+            SendTransactionRequestError::SendTransactionRequestFailed {
+                endpoint: send_transaction_endpoint.endpoint.clone(),
+                send_transaction_request_error,
+            }
+        })?;
+
+    let response_body =
+        read_successful_send_transaction_response(&send_transaction_endpoint.endpoint, response)
+            .await?;
+
+    let response_signature =
+        signature_from_json_rpc_response(&send_transaction_endpoint.endpoint, &response_body)?;
+    validate_response_signature(
+        &send_transaction_endpoint.endpoint,
+        transaction,
+        &response_signature,
+    )
+}
+
+async fn send_transaction_using_triton_sendtx_endpoint(
+    send_transaction_endpoint: &ConfiguredSendTransactionEndpoint,
+    send_transaction_http_client: &Client,
+    transaction: &Transaction,
+) -> Result<(), SendTransactionRequestError> {
+    let serialized_transaction_bytes = serialized_transaction_bytes(transaction)?;
+    let mut request = send_transaction_http_client.post(&send_transaction_endpoint.endpoint);
+
+    if let Some(max_retries) = send_transaction_endpoint.max_retries {
+        request = request.query(&[("max_retries", max_retries.to_string())]);
+    } else {
+        request = request.query(&[("max_retries", "0")]);
+    }
+
+    if send_transaction_endpoint.response_signature {
+        request = request.query(&[("response", "signature")]);
+    }
+
+    if !send_transaction_endpoint.forwarding_policies.is_empty() {
+        request = request.header(
+            "Solana-ForwardingPolicies",
+            send_transaction_endpoint.forwarding_policies.join(","),
+        );
+    }
+
+    let request = match send_transaction_endpoint.encoding {
+        TritonSendTxEncoding::Raw => request
+            .header("Content-Type", "application/octet-stream")
+            .body(serialized_transaction_bytes),
+        TritonSendTxEncoding::Base58 => request
+            .query(&[("encoding", "base58")])
+            .header("Content-Type", "text/plain")
+            .body(bs58::encode(serialized_transaction_bytes).into_string()),
+        TritonSendTxEncoding::Base64 => request
+            .query(&[("encoding", "base64")])
+            .header("Content-Type", "text/plain")
+            .body(BASE64_STANDARD.encode(serialized_transaction_bytes)),
+    };
+
+    let response = request
+        .send()
+        .await
+        .map_err(|send_transaction_request_error| {
+            SendTransactionRequestError::SendTransactionRequestFailed {
+                endpoint: send_transaction_endpoint.endpoint.clone(),
+                send_transaction_request_error,
+            }
+        })?;
+
+    let response_body =
+        read_successful_send_transaction_response(&send_transaction_endpoint.endpoint, response)
+            .await?;
+
+    if send_transaction_endpoint.response_signature {
+        let response_signature =
+            signature_from_sendtx_response(&send_transaction_endpoint.endpoint, &response_body)?;
+        validate_response_signature(
+            &send_transaction_endpoint.endpoint,
+            transaction,
+            &response_signature,
+        )?;
+    }
+
+    Ok(())
+}
+
+async fn read_successful_send_transaction_response(
+    endpoint: &str,
+    response: reqwest::Response,
+) -> Result<String, SendTransactionRequestError> {
+    let response_status = response.status();
+    let response_body = response
+        .text()
+        .await
+        .map_err(|send_transaction_response_read_error| {
+            SendTransactionRequestError::SendTransactionResponseReadFailed {
+                endpoint: endpoint.to_string(),
+                send_transaction_response_read_error,
+            }
+        })?;
+
+    if !response_status.is_success() {
+        return Err(
+            SendTransactionRequestError::SendTransactionRequestNonSuccessStatus {
+                endpoint: endpoint.to_string(),
+                status_code: response_status.as_u16(),
+                response_body,
+            },
+        );
+    }
+
+    Ok(response_body)
+}
+
+fn serialized_transaction_bytes(
+    transaction: &Transaction,
+) -> Result<Vec<u8>, SendTransactionRequestError> {
+    bincode::serialize(transaction).map_err(|error| {
+        SendTransactionRequestError::TransactionSerializationFailed {
+            reason: error.to_string(),
+        }
+    })
+}
+
+fn signature_from_json_rpc_response(
+    endpoint: &str,
+    response_body: &str,
+) -> Result<String, SendTransactionRequestError> {
+    let response_value: Value = serde_json::from_str(response_body).map_err(|error| {
+        SendTransactionRequestError::SendTransactionResponseInvalidJson {
+            endpoint: endpoint.to_string(),
+            response_body: response_body.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+
+    if let Some(error_value) = response_value.get("error") {
+        let error_code = error_value
+            .get("code")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        let error_message = error_value
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Unknown RPC error")
+            .to_string();
+        return Err(
+            SendTransactionRequestError::SendTransactionResponseRpcError {
+                endpoint: endpoint.to_string(),
+                code: error_code,
+                message: error_message,
+            },
+        );
+    }
+
+    response_value
+        .get("result")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .ok_or_else(
+            || SendTransactionRequestError::SendTransactionResponseMissingSignature {
+                endpoint: endpoint.to_string(),
+                response_body: response_body.to_string(),
+            },
+        )
+}
+
+fn signature_from_sendtx_response(
+    endpoint: &str,
+    response_body: &str,
+) -> Result<String, SendTransactionRequestError> {
+    let trimmed_response_body = response_body.trim();
+    if trimmed_response_body.is_empty() {
+        return Err(
+            SendTransactionRequestError::SendTransactionResponseMissingSignature {
+                endpoint: endpoint.to_string(),
+                response_body: response_body.to_string(),
+            },
+        );
+    }
+
+    if trimmed_response_body.starts_with('{') {
+        let response_value: Value =
+            serde_json::from_str(trimmed_response_body).map_err(|error| {
+                SendTransactionRequestError::SendTransactionResponseInvalidJson {
+                    endpoint: endpoint.to_string(),
+                    response_body: response_body.to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
+
+        if let Some(signature) = response_value
+            .get("result")
+            .or_else(|| response_value.get("signature"))
+            .and_then(|value| value.as_str())
+        {
+            return Ok(signature.to_string());
+        }
+
+        return Err(
+            SendTransactionRequestError::SendTransactionResponseMissingSignature {
+                endpoint: endpoint.to_string(),
+                response_body: response_body.to_string(),
+            },
+        );
+    }
+
+    Ok(trimmed_response_body.to_string())
+}
+
+fn validate_response_signature(
+    endpoint: &str,
+    transaction: &Transaction,
+    response_signature: &str,
+) -> Result<(), SendTransactionRequestError> {
+    let expected_signature = transaction.signatures[0].to_string();
+    if response_signature != expected_signature {
+        return Err(
+            SendTransactionRequestError::SendTransactionResponseSignatureMismatch {
+                endpoint: endpoint.to_string(),
+                expected_signature,
+                actual_signature: response_signature.to_string(),
+            },
+        );
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -289,17 +578,20 @@ async fn main() -> Result<()> {
     let rpc_endpoint = std::env::var("RPC_ENDPOINT").expect("RPC_ENDPOINT must be set");
     info!("RPC_ENDPOINT: {:?}", rpc_endpoint);
 
-    let send_transaction_endpoint_from_environment_variable =
-        std::env::var("SEND_TX_ENDPOINT").ok();
-    if let Some(send_transaction_endpoint_value) =
-        &send_transaction_endpoint_from_environment_variable
-    {
-        info!("SEND_TX_ENDPOINT: {:?}", send_transaction_endpoint_value);
+    let configured_send_transaction_endpoint =
+        configured_send_transaction_endpoint_from_environment()?;
+    if let Some(send_transaction_endpoint_value) = &configured_send_transaction_endpoint {
+        info!(
+            "SEND_TX_ENDPOINT: {:?}",
+            send_transaction_endpoint_value.endpoint
+        );
+        info!("SEND_TX_KIND: {:?}", send_transaction_endpoint_value.kind);
     } else {
         info!("SEND_TX_ENDPOINT: [NOT SET]");
     }
-    let resolved_transaction_send_endpoint = send_transaction_endpoint_from_environment_variable
-        .clone()
+    let resolved_transaction_send_endpoint = configured_send_transaction_endpoint
+        .as_ref()
+        .map(|e| e.endpoint.clone())
         .unwrap_or_else(|| rpc_endpoint.clone());
     info!(
         "TRANSACTION_SEND_ENDPOINT: {:?}",
@@ -634,7 +926,7 @@ async fn main() -> Result<()> {
         info!("[TX] Sending initial transaction: {:?}", signature);
         let send_time = Instant::now();
         match send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
-            send_transaction_endpoint_from_environment_variable.as_deref(),
+            configured_send_transaction_endpoint.as_ref(),
             &send_transaction_http_client,
             rpc_client.as_ref(),
             &tx,
@@ -743,7 +1035,7 @@ async fn main() -> Result<()> {
                     // Timeout elapsed (2 seconds passed), resend transaction
                     info!("[TX] Resending transaction: {:?}", signature);
                     match send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
-                        send_transaction_endpoint_from_environment_variable.as_deref(),
+                        configured_send_transaction_endpoint.as_ref(),
                         &send_transaction_http_client,
                         rpc_client.as_ref(),
                         &tx,
