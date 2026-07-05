@@ -628,33 +628,41 @@ async fn send_validators_app_payload(
     client: &Client,
     va_api_key: &str,
     payload: &Value,
+    request_timeout: tokio::time::Duration,
 ) -> Result<()> {
     const MAX_ATTEMPTS: u8 = 3;
     let mut last_error = String::new();
 
     for attempt in 1..=MAX_ATTEMPTS {
-        match client
-            .post("https://www.validators.app/api/v1/ping-thing/mainnet")
-            .header("Content-Type", "application/json")
-            .header("Token", va_api_key)
-            .json(payload)
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    return Ok(());
-                }
+        let request = async {
+            let response = client
+                .post("https://www.validators.app/api/v1/ping-thing/mainnet")
+                .header("Content-Type", "application/json")
+                .header("Token", va_api_key)
+                .json(payload)
+                .send()
+                .await?;
 
-                let status = response.status();
-                let response_body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|error| format!("failed to read response body: {error:?}"));
-                last_error = format!("status {status}: {response_body}");
+            if response.status().is_success() {
+                return Ok(());
             }
-            Err(error) => {
+
+            let status = response.status();
+            let response_body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("failed to read response body: {error:?}"));
+
+            Err(anyhow::anyhow!("status {status}: {response_body}"))
+        };
+
+        match tokio::time::timeout(request_timeout, request).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => {
                 last_error = error.to_string();
+            }
+            Err(_) => {
+                last_error = format!("request timed out after {:?}", request_timeout);
             }
         }
 
@@ -666,6 +674,32 @@ async fn send_validators_app_payload(
     Err(anyhow::anyhow!(
         "failed after {MAX_ATTEMPTS} attempts: {last_error}"
     ))
+}
+
+fn set_watcher_up(metrics: Option<&Arc<Metrics>>, pinger_name: &str, watcher: &str, is_up: bool) {
+    if let Some(metrics) = metrics {
+        metrics
+            .watcher_up
+            .with_label_values(&[pinger_name, watcher])
+            .set(i64::from(is_up));
+    }
+}
+
+fn record_watcher_fatal_error(metrics: Option<&Arc<Metrics>>, pinger_name: &str, watcher: &str) {
+    if let Some(metrics) = metrics {
+        metrics
+            .watcher_fatal_errors
+            .with_label_values(&[pinger_name, watcher])
+            .inc();
+    }
+}
+
+fn validators_app_request_timeout_from_environment() -> tokio::time::Duration {
+    let timeout_ms = std::env::var("VALIDATORS_APP_REQUEST_TIMEOUT_MS")
+        .unwrap_or_else(|_| "5000".to_string())
+        .parse::<u64>()
+        .unwrap_or(5000);
+    tokio::time::Duration::from_millis(timeout_ms)
 }
 
 #[tokio::main]
@@ -772,6 +806,12 @@ async fn main() -> Result<()> {
         .unwrap_or(false);
     info!("SKIP_VALIDATORS_APP: {:?}", skip_validators_app);
 
+    let validators_app_request_timeout = validators_app_request_timeout_from_environment();
+    info!(
+        "VALIDATORS_APP_REQUEST_TIMEOUT_MS: {:?}",
+        validators_app_request_timeout.as_millis()
+    );
+
     let skip_prometheus = std::env::var("SKIP_PROMETHEUS")
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -871,24 +911,25 @@ async fn main() -> Result<()> {
     let blockhash_metrics = metrics.clone();
     let blockhash_pinger_name = pinger_name.clone();
     tokio::spawn(async move {
-        if let Some(metrics) = &blockhash_metrics {
-            metrics
-                .watcher_up
-                .with_label_values(&[&blockhash_pinger_name, "blockhash"])
-                .set(1);
-        }
-        if let Err(e) = watch_blockhash(grpc_client_blockhash, g_blockhash_clone, commitment).await
-        {
-            if let Some(metrics) = &blockhash_metrics {
-                metrics
-                    .watcher_up
-                    .with_label_values(&[&blockhash_pinger_name, "blockhash"])
-                    .set(0);
-                metrics
-                    .watcher_fatal_errors
-                    .with_label_values(&[&blockhash_pinger_name, "blockhash"])
-                    .inc();
-            }
+        set_watcher_up(
+            blockhash_metrics.as_ref(),
+            &blockhash_pinger_name,
+            "blockhash",
+            true,
+        );
+        let result = watch_blockhash(grpc_client_blockhash, g_blockhash_clone, commitment).await;
+        set_watcher_up(
+            blockhash_metrics.as_ref(),
+            &blockhash_pinger_name,
+            "blockhash",
+            false,
+        );
+        if let Err(e) = result {
+            record_watcher_fatal_error(
+                blockhash_metrics.as_ref(),
+                &blockhash_pinger_name,
+                "blockhash",
+            );
             error!(
                 "[Blockhash Watcher] Task failed for commitment {:?}: {:?}",
                 commitment, e
@@ -903,23 +944,11 @@ async fn main() -> Result<()> {
     let slot_metrics = metrics.clone();
     let slot_pinger_name = pinger_name.clone();
     tokio::spawn(async move {
-        if let Some(metrics) = &slot_metrics {
-            metrics
-                .watcher_up
-                .with_label_values(&[&slot_pinger_name, "slot"])
-                .set(1);
-        }
-        if let Err(e) = watch_slot(grpc_client_slot, g_slot_sent_clone, commitment).await {
-            if let Some(metrics) = &slot_metrics {
-                metrics
-                    .watcher_up
-                    .with_label_values(&[&slot_pinger_name, "slot"])
-                    .set(0);
-                metrics
-                    .watcher_fatal_errors
-                    .with_label_values(&[&slot_pinger_name, "slot"])
-                    .inc();
-            }
+        set_watcher_up(slot_metrics.as_ref(), &slot_pinger_name, "slot", true);
+        let result = watch_slot(grpc_client_slot, g_slot_sent_clone, commitment).await;
+        set_watcher_up(slot_metrics.as_ref(), &slot_pinger_name, "slot", false);
+        if let Err(e) = result {
+            record_watcher_fatal_error(slot_metrics.as_ref(), &slot_pinger_name, "slot");
             error!(
                 "[Slot Watcher] Task failed for commitment {:?}: {:?}",
                 commitment, e
@@ -957,30 +986,31 @@ async fn main() -> Result<()> {
     let transaction_metrics = metrics.clone();
     let transaction_pinger_name = pinger_name.clone();
     tokio::spawn(async move {
-        if let Some(metrics) = &transaction_metrics {
-            metrics
-                .watcher_up
-                .with_label_values(&[&transaction_pinger_name, "transaction"])
-                .set(1);
-        }
-        if let Err(e) = watch_transactions(
+        set_watcher_up(
+            transaction_metrics.as_ref(),
+            &transaction_pinger_name,
+            "transaction",
+            true,
+        );
+        let result = watch_transactions(
             grpc_client_transactions,
             tx_updates_tx,
             wallet_pubkey,
             commitment,
         )
-        .await
-        {
-            if let Some(metrics) = &transaction_metrics {
-                metrics
-                    .watcher_up
-                    .with_label_values(&[&transaction_pinger_name, "transaction"])
-                    .set(0);
-                metrics
-                    .watcher_fatal_errors
-                    .with_label_values(&[&transaction_pinger_name, "transaction"])
-                    .inc();
-            }
+        .await;
+        set_watcher_up(
+            transaction_metrics.as_ref(),
+            &transaction_pinger_name,
+            "transaction",
+            false,
+        );
+        if let Err(e) = result {
+            record_watcher_fatal_error(
+                transaction_metrics.as_ref(),
+                &transaction_pinger_name,
+                "transaction",
+            );
             error!(
                 "[Transaction Watcher] Task failed for wallet {:?}: {:?}",
                 wallet_pubkey, e
@@ -1340,6 +1370,7 @@ async fn main() -> Result<()> {
                         &validators_app_http_client,
                         &va_api_key,
                         &payload,
+                        validators_app_request_timeout,
                     )
                     .await
                     {
