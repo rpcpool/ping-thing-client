@@ -1,6 +1,8 @@
 use anyhow::Result;
 use log::{debug, info};
-use prometheus::{Encoder, HistogramOpts, HistogramVec, Registry};
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+};
 use std::sync::Arc;
 use warp::Filter;
 
@@ -8,6 +10,11 @@ pub struct Metrics {
     pub registry: Arc<Registry>,
     pub confirmation_latency: HistogramVec,
     pub slot_latency: HistogramVec,
+    pub watcher_up: IntGaugeVec,
+    pub watcher_fatal_errors: IntCounterVec,
+    pub confirmation_channel_closed: IntCounterVec,
+    pub transaction_timeouts: IntCounterVec,
+    pub validators_app_send_failures: IntCounterVec,
 }
 
 impl Metrics {
@@ -59,15 +66,65 @@ impl Metrics {
             &["pinger_name"],
         )?;
 
+        let watcher_up = IntGaugeVec::new(
+            Opts::new(
+                "ping_thing_client_watcher_up",
+                "Whether a watcher task is running",
+            ),
+            &["pinger_name", "watcher"],
+        )?;
+
+        let watcher_fatal_errors = IntCounterVec::new(
+            Opts::new(
+                "ping_thing_client_watcher_fatal_errors_total",
+                "Fatal watcher task errors",
+            ),
+            &["pinger_name", "watcher"],
+        )?;
+
+        let confirmation_channel_closed = IntCounterVec::new(
+            Opts::new(
+                "ping_thing_client_confirmation_channel_closed_total",
+                "Times the transaction update channel closed",
+            ),
+            &["pinger_name"],
+        )?;
+
+        let transaction_timeouts = IntCounterVec::new(
+            Opts::new(
+                "ping_thing_client_transaction_timeouts_total",
+                "Transactions that were not confirmed before the local timeout",
+            ),
+            &["pinger_name"],
+        )?;
+
+        let validators_app_send_failures = IntCounterVec::new(
+            Opts::new(
+                "ping_thing_client_validators_app_send_failures_total",
+                "Validators.app API send failures",
+            ),
+            &["pinger_name"],
+        )?;
+
         info!("[Metrics] Registering metrics with Prometheus registry...");
         registry.register(Box::new(confirmation_latency.clone()))?;
         registry.register(Box::new(slot_latency.clone()))?;
+        registry.register(Box::new(watcher_up.clone()))?;
+        registry.register(Box::new(watcher_fatal_errors.clone()))?;
+        registry.register(Box::new(confirmation_channel_closed.clone()))?;
+        registry.register(Box::new(transaction_timeouts.clone()))?;
+        registry.register(Box::new(validators_app_send_failures.clone()))?;
         info!("[Metrics] All metrics registered successfully");
 
         Ok(Self {
             registry,
             confirmation_latency,
             slot_latency,
+            watcher_up,
+            watcher_fatal_errors,
+            confirmation_channel_closed,
+            transaction_timeouts,
+            validators_app_send_failures,
         })
     }
 
@@ -113,6 +170,26 @@ mod tests {
             .slot_latency
             .with_label_values(&["test-pinger"])
             .observe(1.0);
+        metrics
+            .watcher_up
+            .with_label_values(&["test-pinger", "transaction"])
+            .set(1);
+        metrics
+            .watcher_fatal_errors
+            .with_label_values(&["test-pinger", "transaction"])
+            .inc();
+        metrics
+            .confirmation_channel_closed
+            .with_label_values(&["test-pinger"])
+            .inc();
+        metrics
+            .transaction_timeouts
+            .with_label_values(&["test-pinger"])
+            .inc();
+        metrics
+            .validators_app_send_failures
+            .with_label_values(&["test-pinger"])
+            .inc();
 
         encoder
             .encode(&metrics.registry.gather(), &mut buffer)
@@ -121,5 +198,10 @@ mod tests {
         let rendered = String::from_utf8(buffer).unwrap();
         assert!(rendered.contains("ping_thing_client_confirmation_latency"));
         assert!(rendered.contains("ping_thing_client_slot_latency"));
+        assert!(rendered.contains("ping_thing_client_watcher_up"));
+        assert!(rendered.contains("ping_thing_client_watcher_fatal_errors_total"));
+        assert!(rendered.contains("ping_thing_client_confirmation_channel_closed_total"));
+        assert!(rendered.contains("ping_thing_client_transaction_timeouts_total"));
+        assert!(rendered.contains("ping_thing_client_validators_app_send_failures_total"));
     }
 }

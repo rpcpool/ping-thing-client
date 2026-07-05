@@ -624,6 +624,50 @@ fn validate_response_signature(
     Ok(())
 }
 
+async fn send_validators_app_payload(
+    client: &Client,
+    va_api_key: &str,
+    payload: &Value,
+) -> Result<()> {
+    const MAX_ATTEMPTS: u8 = 3;
+    let mut last_error = String::new();
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match client
+            .post("https://www.validators.app/api/v1/ping-thing/mainnet")
+            .header("Content-Type", "application/json")
+            .header("Token", va_api_key)
+            .json(payload)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    return Ok(());
+                }
+
+                let status = response.status();
+                let response_body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("failed to read response body: {error:?}"));
+                last_error = format!("status {status}: {response_body}");
+            }
+            Err(error) => {
+                last_error = error.to_string();
+            }
+        }
+
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200 * u64::from(attempt))).await;
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed after {MAX_ATTEMPTS} attempts: {last_error}"
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     info!("=== Starting Ping Thing Client ===");
@@ -761,6 +805,7 @@ async fn main() -> Result<()> {
 
     let rpc_client = Arc::new(RpcClient::new(rpc_endpoint.clone()));
     let send_transaction_http_client = Client::new();
+    let validators_app_http_client = Client::new();
 
     let g_blockhash = Arc::new(Mutex::new(GlobalBlockhash::new()));
     let g_slot_sent = Arc::new(Mutex::new(GlobalSlotSent::new()));
@@ -823,9 +868,27 @@ async fn main() -> Result<()> {
     // Spawn blockhash watching task
     let g_blockhash_clone = Arc::clone(&g_blockhash);
     let grpc_client_blockhash = Arc::clone(&shared_grpc_client);
+    let blockhash_metrics = metrics.clone();
+    let blockhash_pinger_name = pinger_name.clone();
     tokio::spawn(async move {
+        if let Some(metrics) = &blockhash_metrics {
+            metrics
+                .watcher_up
+                .with_label_values(&[&blockhash_pinger_name, "blockhash"])
+                .set(1);
+        }
         if let Err(e) = watch_blockhash(grpc_client_blockhash, g_blockhash_clone, commitment).await
         {
+            if let Some(metrics) = &blockhash_metrics {
+                metrics
+                    .watcher_up
+                    .with_label_values(&[&blockhash_pinger_name, "blockhash"])
+                    .set(0);
+                metrics
+                    .watcher_fatal_errors
+                    .with_label_values(&[&blockhash_pinger_name, "blockhash"])
+                    .inc();
+            }
             error!(
                 "[Blockhash Watcher] Task failed for commitment {:?}: {:?}",
                 commitment, e
@@ -837,8 +900,26 @@ async fn main() -> Result<()> {
     // Spawn slot watching task
     let g_slot_sent_clone = Arc::clone(&g_slot_sent);
     let grpc_client_slot = Arc::clone(&shared_grpc_client);
+    let slot_metrics = metrics.clone();
+    let slot_pinger_name = pinger_name.clone();
     tokio::spawn(async move {
+        if let Some(metrics) = &slot_metrics {
+            metrics
+                .watcher_up
+                .with_label_values(&[&slot_pinger_name, "slot"])
+                .set(1);
+        }
         if let Err(e) = watch_slot(grpc_client_slot, g_slot_sent_clone, commitment).await {
+            if let Some(metrics) = &slot_metrics {
+                metrics
+                    .watcher_up
+                    .with_label_values(&[&slot_pinger_name, "slot"])
+                    .set(0);
+                metrics
+                    .watcher_fatal_errors
+                    .with_label_values(&[&slot_pinger_name, "slot"])
+                    .inc();
+            }
             error!(
                 "[Slot Watcher] Task failed for commitment {:?}: {:?}",
                 commitment, e
@@ -873,7 +954,15 @@ async fn main() -> Result<()> {
 
     // Spawn transaction watching task for the wallet
     let grpc_client_transactions = Arc::clone(&shared_grpc_client);
+    let transaction_metrics = metrics.clone();
+    let transaction_pinger_name = pinger_name.clone();
     tokio::spawn(async move {
+        if let Some(metrics) = &transaction_metrics {
+            metrics
+                .watcher_up
+                .with_label_values(&[&transaction_pinger_name, "transaction"])
+                .set(1);
+        }
         if let Err(e) = watch_transactions(
             grpc_client_transactions,
             tx_updates_tx,
@@ -882,6 +971,16 @@ async fn main() -> Result<()> {
         )
         .await
         {
+            if let Some(metrics) = &transaction_metrics {
+                metrics
+                    .watcher_up
+                    .with_label_values(&[&transaction_pinger_name, "transaction"])
+                    .set(0);
+                metrics
+                    .watcher_fatal_errors
+                    .with_label_values(&[&transaction_pinger_name, "transaction"])
+                    .inc();
+            }
             error!(
                 "[Transaction Watcher] Task failed for wallet {:?}: {:?}",
                 wallet_pubkey, e
@@ -1064,9 +1163,11 @@ async fn main() -> Result<()> {
         }
         info!("[TX] Stored transaction in sent_transactions map");
 
-        // Start 20-second resend loop with confirmation handling
-        info!("[TX] Starting resend loop (20 second timeout)...");
-        let timeout_duration = tokio::time::Duration::from_secs(20);
+        info!(
+            "[TX] Starting resend loop ({:?} second timeout)...",
+            tx_confirmation_timeout
+        );
+        let timeout_duration = tokio::time::Duration::from_secs(tx_confirmation_timeout);
         let resend_interval_duration = tokio::time::Duration::from_millis(2000);
 
         let mut confirmed = false;
@@ -1079,9 +1180,15 @@ async fn main() -> Result<()> {
             // Check if timeout elapsed
             if start_time.elapsed() >= timeout_duration {
                 warn!(
-                    "[TX] Transaction {:?} timed out after 20 seconds",
-                    signature
+                    "[TX] Transaction {:?} timed out after {:?} seconds",
+                    signature, tx_confirmation_timeout
                 );
+                if let Some(ref metrics) = metrics {
+                    metrics
+                        .transaction_timeouts
+                        .with_label_values(&[&pinger_name])
+                        .inc();
+                }
                 break;
             }
 
@@ -1108,12 +1215,19 @@ async fn main() -> Result<()> {
                     }
                 }
                 Ok(None) => {
-                    // Channel closed
+                    if let Some(ref metrics) = metrics {
+                        metrics
+                            .confirmation_channel_closed
+                            .with_label_values(&[&pinger_name])
+                            .inc();
+                    }
                     error!(
                         "[TX] Transaction update channel closed unexpectedly for signature: {:?}",
                         signature
                     );
-                    break;
+                    return Err(anyhow::anyhow!(
+                        "transaction update channel closed while waiting for signature {signature}"
+                    ));
                 }
                 Err(_) => {
                     // Timeout elapsed (2 seconds passed), resend transaction
@@ -1222,26 +1336,23 @@ async fn main() -> Result<()> {
                 if !skip_validators_app {
                     info!("[TX] Sending metrics to Validators.app...");
 
-                    let client = Client::new();
-                    match client
-                        .post("https://www.validators.app/api/v1/ping-thing/mainnet")
-                        .header("Content-Type", "application/json")
-                        .header("Token", &va_api_key)
-                        .json(&payload)
-                        .send()
-                        .await
+                    match send_validators_app_payload(
+                        &validators_app_http_client,
+                        &va_api_key,
+                        &payload,
+                    )
+                    .await
                     {
-                        Ok(response) => {
-                            if response.status().is_success() {
-                                info!("[TX] Successfully sent metrics to Validators.app");
-                            } else {
-                                error!(
-                                    "[TX] Failed to send to Validators.app for signature {:?} - Status: {:?}",
-                                    signature, response.status()
-                                );
-                            }
+                        Ok(()) => {
+                            info!("[TX] Successfully sent metrics to Validators.app");
                         }
                         Err(e) => {
+                            if let Some(ref metrics) = metrics {
+                                metrics
+                                    .validators_app_send_failures
+                                    .with_label_values(&[&pinger_name])
+                                    .inc();
+                            }
                             error!(
                                 "[TX] Error sending to Validators.app for signature {:?}: {:?}",
                                 signature, e
@@ -1264,8 +1375,8 @@ async fn main() -> Result<()> {
             }
         } else {
             warn!(
-                "[TX] Transaction {:?} not confirmed or failed after 20 seconds",
-                signature
+                "[TX] Transaction {:?} not confirmed or failed after {:?} seconds",
+                signature, tx_confirmation_timeout
             );
         }
 

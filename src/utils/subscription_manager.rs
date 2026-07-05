@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use log::{error, info};
+use log::info;
 use solana_pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use yellowstone_grpc_proto::prelude::{
 /// Watches all transactions for a specific wallet pubkey via gRPC subscription
 /// Sends (signature, slot_landed, confirmed) tuples through the channel
 pub async fn watch_transactions(
-    grpc_client: Arc<Mutex<GeyserGrpcClient<impl yellowstone_grpc_client::Interceptor + 'static>>>,
+    grpc_client: Arc<Mutex<GeyserGrpcClient>>,
     tx_updates_tx: mpsc::Sender<(String, u64, bool)>,
     wallet_pubkey: Pubkey,
     commitment: CommitmentLevel,
@@ -30,11 +30,12 @@ pub async fn watch_transactions(
         "wallet_transactions".to_string(),
         SubscribeRequestFilterTransactions {
             vote: Some(false),
-            failed: Some(false), // Include both successful and failed transactions
-            signature: None,     // Watch all transactions, not a specific one
+            failed: Some(false),
+            signature: None, // Watch all transactions, not a specific one
             account_include: vec![wallet_pubkey.to_string()],
             account_exclude: vec![],
             account_required: vec![wallet_pubkey.to_string()],
+            token_accounts: None,
         },
     );
 
@@ -44,10 +45,10 @@ pub async fn watch_transactions(
         ..Default::default()
     };
 
-    let (_subscribe_tx, mut stream) = {
+    let mut stream = {
         let mut client = grpc_client.lock().await;
         client
-            .subscribe_with_request(Some(subscribe_request))
+            .subscribe_once(subscribe_request)
             .await
             .context("Failed to create transaction subscription")?
     };
@@ -81,22 +82,28 @@ pub async fn watch_transactions(
                             ))
                             .await
                         {
-                            error!(
+                            return Err(anyhow::anyhow!(
                                 "[Transaction Watcher] Failed to send transaction update for signature {:?}, slot {:?}, confirmed {:?}: {:?}",
-                                tx_signature, slot_landed, confirmed, e
-                            );
+                                tx_signature,
+                                slot_landed,
+                                confirmed,
+                                e
+                            ));
                         }
                     }
                 }
             }
             Err(e) => {
-                error!(
-                    "[Transaction Watcher] Stream error for wallet {:?}: {:?}",
-                    wallet_pubkey, e
-                );
-                break;
+                return Err(anyhow::anyhow!(
+                    "[Transaction Watcher] Fatal stream error for wallet {:?}: {:?}",
+                    wallet_pubkey,
+                    e
+                ));
             }
         }
     }
-    Ok(())
+    Err(anyhow::anyhow!(
+        "[Transaction Watcher] Stream ended for wallet {:?}",
+        wallet_pubkey
+    ))
 }

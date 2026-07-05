@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use log::{error, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -27,7 +26,7 @@ impl GlobalSlotSent {
 
 /// Watches slot updates via gRPC subscription
 pub async fn watch_slot(
-    grpc_client: Arc<Mutex<GeyserGrpcClient<impl yellowstone_grpc_client::Interceptor + 'static>>>,
+    grpc_client: Arc<Mutex<GeyserGrpcClient>>,
     g_slot_sent: Arc<Mutex<GlobalSlotSent>>,
     _commitment: CommitmentLevel,
 ) -> Result<()> {
@@ -46,10 +45,10 @@ pub async fn watch_slot(
         ..Default::default()
     };
 
-    let (_subscribe_tx, mut stream) = {
+    let mut stream = {
         let mut client = grpc_client.lock().await;
         client
-            .subscribe_with_request(Some(subscribe_request))
+            .subscribe_once(subscribe_request)
             .await
             .context("Failed to create slot subscription")?
     };
@@ -89,20 +88,17 @@ pub async fn watch_slot(
                 }
             }
             Err(e) => {
-                error!(
-                    "[Slot Watcher] Error in stream (message #{:?}): {:?}",
-                    message_count, e
-                );
-                // Stream error - will need to reconnect
-                break;
+                return Err(anyhow::anyhow!(
+                    "[Slot Watcher] Fatal stream error after {:?} messages: {:?}",
+                    message_count,
+                    e
+                ));
             }
         }
     }
 
-    warn!(
+    Err(anyhow::anyhow!(
         "[Slot Watcher] Stream ended after processing {:?} messages",
         message_count
-    );
-
-    Ok(())
+    ))
 }
