@@ -9,6 +9,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_hash::Hash;
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_message::Message;
@@ -667,14 +668,17 @@ async fn wait_for_watcher_ready(ready_rx: oneshot::Receiver<()>, watcher: &str) 
         .with_context(|| format!("{watcher} watcher stopped before subscribing"))
 }
 
-async fn wait_for_fresh_blockhash(
+async fn wait_for_new_blockhash(
     blockhash_rx: &mut watch::Receiver<Option<BlockhashSnapshot>>,
+    last_used_blockhash: Option<Hash>,
 ) -> Result<BlockhashSnapshot> {
     const MAX_AGE: Duration = Duration::from_secs(10);
 
     loop {
         let snapshot = *blockhash_rx.borrow_and_update();
-        if let Some(snapshot) = snapshot.filter(|value| value.observed_at.elapsed() < MAX_AGE) {
+        if let Some(snapshot) = snapshot.filter(|value| {
+            value.observed_at.elapsed() < MAX_AGE && Some(value.value) != last_used_blockhash
+        }) {
             return Ok(snapshot);
         }
 
@@ -700,27 +704,24 @@ async fn wait_for_fresh_slot(
     }
 }
 
-fn current_priority_fee(
-    use_priority_fee: bool,
-    configured_fee: u64,
-    priority_fee_rx: &watch::Receiver<Option<PriorityFeeSnapshot>>,
-) -> u64 {
-    const MAX_AGE: Duration = Duration::from_secs(2);
+async fn wait_for_priority_fee(
+    priority_fee_rx: &mut watch::Receiver<Option<PriorityFeeSnapshot>>,
+) -> Result<PriorityFeeSnapshot> {
+    loop {
+        if let Some(snapshot) = *priority_fee_rx.borrow_and_update() {
+            return Ok(snapshot);
+        }
 
-    if !use_priority_fee {
-        return 0;
+        priority_fee_rx
+            .changed()
+            .await
+            .context("priority fee watcher stopped before returning a value")?;
     }
-
-    priority_fee_rx
-        .borrow()
-        .filter(|snapshot| snapshot.observed_at.elapsed() < MAX_AGE)
-        .map_or(configured_fee, |snapshot| snapshot.value)
 }
 
 fn retry_reason_name(reason: RetryReason) -> &'static str {
     match reason {
         RetryReason::SendFailed => "send failed",
-        RetryReason::SendTimedOut => "send timed out",
         RetryReason::ConfirmationWaitExpired => "no gRPC confirmation after 2 seconds",
     }
 }
@@ -847,18 +848,9 @@ async fn main() -> Result<()> {
         .unwrap_or(false);
     info!("USE_PRIORITY_FEE: {:?}", use_priority_fee);
 
-    let priority_fee_micro_lamports = if use_priority_fee {
-        std::env::var("PRIORITY_FEE_MICRO_LAMPORTS")
-            .unwrap_or_else(|_| "5000".to_string())
-            .parse::<u64>()
-            .unwrap_or(5000)
-    } else {
-        0
-    };
-    info!(
-        "PRIORITY_FEE_MICRO_LAMPORTS: {:?}",
-        priority_fee_micro_lamports
-    );
+    if use_priority_fee {
+        info!("Priority fee source: latest successful RPC response");
+    }
 
     let pinger_region = std::env::var("PINGER_REGION").expect("PINGER_REGION must be set");
     info!("PINGER_REGION: {:?}", pinger_region);
@@ -957,15 +949,14 @@ async fn main() -> Result<()> {
         info!("Prometheus metrics server task spawned");
     }
 
-    let (grpc_client_blockhash, grpc_client_slot, grpc_client_transactions) = tokio::try_join!(
-        create_grpc_client(&grpc_endpoint, grpc_x_token.clone()),
-        create_grpc_client(&grpc_endpoint, grpc_x_token.clone()),
-        create_grpc_client(&grpc_endpoint, grpc_x_token.clone()),
-    )?;
+    let grpc_client = create_grpc_client(&grpc_endpoint, grpc_x_token).await?;
+    let grpc_client_blockhash = grpc_client.clone();
+    let grpc_client_slot = grpc_client.clone();
+    let grpc_client_transactions = grpc_client;
 
     let (blockhash_tx, mut blockhash_rx) = watch::channel(None);
     let (slot_tx, mut slot_rx) = watch::channel(None);
-    let (priority_fee_tx, priority_fee_rx) = watch::channel(None);
+    let (priority_fee_tx, mut priority_fee_rx) = watch::channel(None);
     let (active_transaction_tx, active_transaction_rx) =
         watch::channel::<Option<ActiveTransaction>>(None);
     let (watcher_failure_tx, mut watcher_failure_rx) = mpsc::unbounded_channel::<String>();
@@ -1099,11 +1090,26 @@ async fn main() -> Result<()> {
     set_watcher_up(metrics.as_ref(), &pinger_name, "slot", true);
     set_watcher_up(metrics.as_ref(), &pinger_name, "transaction", true);
 
+    if use_priority_fee {
+        info!("[Priority Fees] Waiting for the first RPC value");
+        let first_priority_fee = tokio::select! {
+            result = wait_for_priority_fee(&mut priority_fee_rx) => result?,
+            Some(watcher) = watcher_failure_rx.recv() => {
+                anyhow::bail!("{watcher} watcher stopped");
+            }
+        };
+        info!(
+            "[Priority Fees] Initial value cached: priority_fee_micro_lamports={:?}",
+            first_priority_fee.value
+        );
+    }
+
     info!("=== Entering main transaction loop ===");
 
     let tx_window_duration = Duration::from_secs(60);
     let mut tx_count: u64 = 0;
     let mut tx_window_start = Instant::now();
+    let mut last_used_blockhash = None;
 
     loop {
         if tx_window_start.elapsed() >= tx_window_duration {
@@ -1139,14 +1145,21 @@ async fn main() -> Result<()> {
             anyhow::bail!("{watcher} watcher stopped");
         }
 
-        info!("[TX] Waiting for a fresh blockhash and slot");
+        info!("[TX] Waiting for a new blockhash and fresh slot");
         let blockhash_wait = async {
-            tokio::time::timeout(
+            let wait_started_at = Instant::now();
+            let result = tokio::time::timeout(
                 Duration::from_secs(10),
-                wait_for_fresh_blockhash(&mut blockhash_rx),
+                wait_for_new_blockhash(&mut blockhash_rx, last_used_blockhash),
             )
-            .await
-            .context("timed out after 10 seconds waiting for a fresh blockhash")?
+            .await;
+            if let Some(metrics) = &metrics {
+                metrics
+                    .blockhash_wait_duration
+                    .with_label_values(&[&pinger_name])
+                    .observe(wait_started_at.elapsed().as_secs_f64() * 1_000.0);
+            }
+            result.context("timed out after 10 seconds waiting for a new blockhash")?
         };
         let slot_wait = async {
             tokio::time::timeout(Duration::from_secs(10), wait_for_fresh_slot(&mut slot_rx))
@@ -1156,11 +1169,24 @@ async fn main() -> Result<()> {
         let (blockhash_snapshot, slot_snapshot) = tokio::try_join!(blockhash_wait, slot_wait)?;
         let blockhash = blockhash_snapshot.value;
         let slot_sent = slot_snapshot.value;
-        let current_priority_fee = current_priority_fee(
-            use_priority_fee,
-            priority_fee_micro_lamports,
-            &priority_fee_rx,
-        );
+        let priority_fee_snapshot = if use_priority_fee {
+            Some(
+                priority_fee_rx
+                    .borrow()
+                    .as_ref()
+                    .copied()
+                    .context("priority fee cache unexpectedly empty")?,
+            )
+        } else {
+            None
+        };
+        let current_priority_fee = priority_fee_snapshot.map_or(0, |snapshot| snapshot.value);
+        if let (Some(metrics), Some(snapshot)) = (&metrics, priority_fee_snapshot) {
+            metrics
+                .priority_fee_cache_age
+                .with_label_values(&[&pinger_name])
+                .set(snapshot.observed_at.elapsed().as_secs_f64() * 1_000.0);
+        }
         info!(
             "[TX] Fresh inputs ready: slot={:?}, blockhash={:?}, priority_fee_micro_lamports={:?}",
             slot_sent, blockhash, current_priority_fee
@@ -1178,6 +1204,7 @@ async fn main() -> Result<()> {
         let message =
             Message::new_with_blockhash(&instructions, Some(&wallet_keypair.pubkey()), &blockhash);
         let tx = Transaction::new(&[&wallet_keypair], message, blockhash);
+        last_used_blockhash = Some(blockhash);
 
         let signature = tx.signatures[0].to_string();
         let signature_bytes: TransactionSignatureBytes = tx.signatures[0]
@@ -1200,18 +1227,26 @@ async fn main() -> Result<()> {
                 Duration::from_secs(tx_confirmation_timeout),
                 Duration::from_secs(2),
                 |attempt_number| {
-                    let configured_send_transaction_endpoint =
-                        configured_send_transaction_endpoint.as_ref();
-                    let send_transaction_http_client = &send_transaction_http_client;
-                    let rpc_client = rpc_client.as_ref();
-                    let tx = &tx;
                     let signature = &signature;
                     async move {
                         info!(
                             "[TX] Sending transaction: signature={:?}, attempt={:?}",
                             signature, attempt_number
                         );
-                        match send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
+                    }
+                },
+                |attempt_number| {
+                    let configured_send_transaction_endpoint =
+                        configured_send_transaction_endpoint.as_ref();
+                    let send_transaction_http_client = &send_transaction_http_client;
+                    let rpc_client = rpc_client.as_ref();
+                    let tx = &tx;
+                    let signature = &signature;
+                    let metrics = metrics.as_ref();
+                    let pinger_name = &pinger_name;
+                    async move {
+                        let send_request_started_at = Instant::now();
+                        let result = send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
                             configured_send_transaction_endpoint,
                             send_transaction_http_client,
                             rpc_client,
@@ -1222,8 +1257,17 @@ async fn main() -> Result<()> {
                                 ..Default::default()
                             },
                         )
-                        .await
-                        {
+                        .await;
+                        if let Some(metrics) = metrics {
+                            let outcome = if result.is_ok() { "success" } else { "failure" };
+                            metrics
+                                .send_request_duration
+                                .with_label_values(&[pinger_name, transaction_send_kind, outcome])
+                                .observe(
+                                    send_request_started_at.elapsed().as_secs_f64() * 1_000.0,
+                                );
+                        }
+                        match result {
                             Ok(()) => {
                                 info!(
                                     "[TX] Send accepted: signature={:?}, attempt={:?}; waiting for gRPC confirmation",
@@ -1390,6 +1434,74 @@ mod tests {
         assert_eq!(
             signature_from_sendtx_response("http://sendtx", &response_body).unwrap(),
             signature
+        );
+    }
+
+    #[tokio::test]
+    async fn same_blockhash_waits_until_a_new_value_arrives() {
+        let first_hash = Hash::new_from_array([1; 32]);
+        let second_hash = Hash::new_from_array([2; 32]);
+        let (blockhash_tx, mut blockhash_rx) = watch::channel(Some(BlockhashSnapshot {
+            value: first_hash,
+            observed_at: Instant::now(),
+        }));
+
+        let task = tokio::spawn(async move {
+            wait_for_new_blockhash(&mut blockhash_rx, Some(first_hash)).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        blockhash_tx.send_replace(Some(BlockhashSnapshot {
+            value: second_hash,
+            observed_at: Instant::now(),
+        }));
+
+        let snapshot = task.await.unwrap().unwrap();
+        assert_eq!(snapshot.value, second_hash);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_priority_fee_does_not_expire() {
+        let snapshot = PriorityFeeSnapshot {
+            value: 42_000,
+            observed_at: Instant::now(),
+        };
+        let (_priority_fee_tx, mut priority_fee_rx) = watch::channel(Some(snapshot));
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let cached = wait_for_priority_fee(&mut priority_fee_rx).await.unwrap();
+
+        assert_eq!(cached.value, snapshot.value);
+        assert_eq!(cached.observed_at, snapshot.observed_at);
+    }
+
+    #[tokio::test]
+    async fn priority_fee_waits_for_first_rpc_value() {
+        let (priority_fee_tx, mut priority_fee_rx) = watch::channel(None);
+        let task = tokio::spawn(async move { wait_for_priority_fee(&mut priority_fee_rx).await });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        priority_fee_tx.send_replace(Some(PriorityFeeSnapshot {
+            value: 51_000,
+            observed_at: Instant::now(),
+        }));
+
+        assert_eq!(task.await.unwrap().unwrap().value, 51_000);
+    }
+
+    #[test]
+    fn grafana_dashboard_contains_local_delay_panels() {
+        let dashboard: Value = serde_json::from_str(include_str!("../grafana-pt.json")).unwrap();
+
+        assert_eq!(
+            dashboard["elements"]["panel-10"]["spec"]["title"],
+            "p95 Local Transaction Delays"
+        );
+        assert_eq!(
+            dashboard["elements"]["panel-11"]["spec"]["title"],
+            "Priority Fee Cache Age"
         );
     }
 }

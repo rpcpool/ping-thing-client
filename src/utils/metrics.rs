@@ -1,7 +1,7 @@
 use anyhow::Result;
 use log::{debug, info};
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
 };
 use std::sync::Arc;
 use warp::Filter;
@@ -14,6 +14,9 @@ pub struct Metrics {
     pub watcher_fatal_errors: IntCounterVec,
     pub transaction_timeouts: IntCounterVec,
     pub transaction_retries: HistogramVec,
+    pub send_request_duration: HistogramVec,
+    pub blockhash_wait_duration: HistogramVec,
+    pub priority_fee_cache_age: GaugeVec,
     pub validators_app_send_failures: IntCounterVec,
 }
 
@@ -100,6 +103,36 @@ impl Metrics {
             &["pinger_name"],
         )?;
 
+        let request_duration_buckets = vec![
+            1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0,
+            10_000.0, 30_000.0, 60_000.0,
+        ];
+        let send_request_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "ping_thing_client_send_request_duration_ms",
+                "Time spent waiting for a transaction send request in milliseconds",
+            )
+            .buckets(request_duration_buckets.clone()),
+            &["pinger_name", "send_kind", "outcome"],
+        )?;
+
+        let blockhash_wait_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "ping_thing_client_blockhash_wait_duration_ms",
+                "Time spent waiting for a new blockhash in milliseconds",
+            )
+            .buckets(request_duration_buckets),
+            &["pinger_name"],
+        )?;
+
+        let priority_fee_cache_age = GaugeVec::new(
+            Opts::new(
+                "ping_thing_client_priority_fee_cache_age_ms",
+                "Age of the last successful priority fee response in milliseconds",
+            ),
+            &["pinger_name"],
+        )?;
+
         let validators_app_send_failures = IntCounterVec::new(
             Opts::new(
                 "ping_thing_client_validators_app_send_failures_total",
@@ -115,6 +148,9 @@ impl Metrics {
         registry.register(Box::new(watcher_fatal_errors.clone()))?;
         registry.register(Box::new(transaction_timeouts.clone()))?;
         registry.register(Box::new(transaction_retries.clone()))?;
+        registry.register(Box::new(send_request_duration.clone()))?;
+        registry.register(Box::new(blockhash_wait_duration.clone()))?;
+        registry.register(Box::new(priority_fee_cache_age.clone()))?;
         registry.register(Box::new(validators_app_send_failures.clone()))?;
         info!("[Metrics] All metrics registered successfully");
 
@@ -126,6 +162,9 @@ impl Metrics {
             watcher_fatal_errors,
             transaction_timeouts,
             transaction_retries,
+            send_request_duration,
+            blockhash_wait_duration,
+            priority_fee_cache_age,
             validators_app_send_failures,
         })
     }
@@ -193,6 +232,18 @@ mod tests {
             .with_label_values(&["test-pinger"])
             .observe(2.0);
         metrics
+            .send_request_duration
+            .with_label_values(&["test-pinger", "json_rpc", "success"])
+            .observe(12.0);
+        metrics
+            .blockhash_wait_duration
+            .with_label_values(&["test-pinger"])
+            .observe(25.0);
+        metrics
+            .priority_fee_cache_age
+            .with_label_values(&["test-pinger"])
+            .set(300.0);
+        metrics
             .validators_app_send_failures
             .with_label_values(&["test-pinger"])
             .inc();
@@ -213,6 +264,9 @@ mod tests {
         ));
         assert!(rendered
             .contains("ping_thing_client_transaction_retries_sum{pinger_name=\"test-pinger\"} 3"));
+        assert!(rendered.contains("ping_thing_client_send_request_duration_ms_bucket"));
+        assert!(rendered.contains("ping_thing_client_blockhash_wait_duration_ms_bucket"));
+        assert!(rendered.contains("ping_thing_client_priority_fee_cache_age_ms"));
         assert!(rendered.contains("ping_thing_client_validators_app_send_failures_total"));
     }
 }

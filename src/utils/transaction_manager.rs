@@ -32,27 +32,28 @@ pub enum SendAndConfirmOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryReason {
     SendFailed,
-    SendTimedOut,
     ConfirmationWaitExpired,
 }
 
 enum SendAttemptOutcome {
     Succeeded,
     Failed,
-    TimedOut,
 }
 
-pub async fn send_and_confirm<F, Fut, R>(
+pub async fn send_and_confirm<F, Fut, A, AttemptFut, R>(
     signature: TransactionSignatureBytes,
     active_transaction_tx: &watch::Sender<Option<ActiveTransaction>>,
     confirmation_timeout: Duration,
     resend_interval: Duration,
+    mut before_send_attempt: A,
     mut send_transaction: F,
     mut record_retry: R,
 ) -> SendAndConfirmOutcome
 where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = bool>,
+    A: FnMut(u64) -> AttemptFut,
+    AttemptFut: Future<Output = ()>,
     R: FnMut(u64, RetryReason),
 {
     let (landed_tx, mut landed_rx) = mpsc::channel(1);
@@ -61,28 +62,35 @@ where
         landed_tx,
     }));
 
-    let send_started_at = Instant::now();
-    let confirmation_deadline = send_started_at + confirmation_timeout;
+    let mut send_started_at = None;
+    let mut confirmation_deadline = None;
     let mut retry_number = 0u64;
     let mut attempt_number = 0u64;
 
     let outcome = 'confirmation: loop {
-        if Instant::now() >= confirmation_deadline {
-            break SendAndConfirmOutcome::TimedOut;
+        if let Some(confirmation_deadline) = confirmation_deadline {
+            if Instant::now() >= confirmation_deadline {
+                break SendAndConfirmOutcome::TimedOut;
+            }
+        }
+        if let Ok(landed) = landed_rx.try_recv() {
+            let send_started_at = send_started_at.unwrap_or(landed.observed_at);
+            break confirmed_transaction(landed, send_started_at);
         }
 
-        let send_deadline = (Instant::now() + resend_interval).min(confirmation_deadline);
         attempt_number = attempt_number.saturating_add(1);
+        before_send_attempt(attempt_number).await;
+
+        let first_send_started_at = *send_started_at.get_or_insert_with(Instant::now);
+        let confirmation_deadline =
+            *confirmation_deadline.get_or_insert(first_send_started_at + confirmation_timeout);
         let send_outcome = tokio::select! {
             biased;
             Some(landed) = landed_rx.recv() => {
-                break 'confirmation confirmed_transaction(landed, send_started_at);
+                break 'confirmation confirmed_transaction(landed, first_send_started_at);
             }
             _ = sleep_until(confirmation_deadline) => {
                 break 'confirmation SendAndConfirmOutcome::TimedOut;
-            }
-            _ = sleep_until(send_deadline) => {
-                SendAttemptOutcome::TimedOut
             }
             result = send_transaction(attempt_number) => {
                 if result {
@@ -93,14 +101,9 @@ where
             },
         };
 
-        if !matches!(send_outcome, SendAttemptOutcome::Succeeded) {
+        if matches!(send_outcome, SendAttemptOutcome::Failed) {
             retry_number = retry_number.saturating_add(1);
-            let reason = match send_outcome {
-                SendAttemptOutcome::Failed => RetryReason::SendFailed,
-                SendAttemptOutcome::TimedOut => RetryReason::SendTimedOut,
-                SendAttemptOutcome::Succeeded => unreachable!("success was handled above"),
-            };
-            record_retry(retry_number, reason);
+            record_retry(retry_number, RetryReason::SendFailed);
             tokio::task::yield_now().await;
             continue;
         }
@@ -109,7 +112,7 @@ where
         tokio::select! {
             biased;
             Some(landed) = landed_rx.recv() => {
-                break 'confirmation confirmed_transaction(landed, send_started_at);
+                break 'confirmation confirmed_transaction(landed, first_send_started_at);
             }
             _ = sleep_until(confirmation_deadline) => {
                 break 'confirmation SendAndConfirmOutcome::TimedOut;
@@ -148,8 +151,7 @@ mod tests {
     fn retry_reason_code(reason: RetryReason) -> usize {
         match reason {
             RetryReason::SendFailed => 1,
-            RetryReason::SendTimedOut => 2,
-            RetryReason::ConfirmationWaitExpired => 3,
+            RetryReason::ConfirmationWaitExpired => 2,
         }
     }
 
@@ -169,6 +171,7 @@ mod tests {
                 &active_tx,
                 Duration::from_secs(1),
                 Duration::from_millis(100),
+                |_| async {},
                 move |_| {
                     let attempt = attempts_for_send.fetch_add(1, Ordering::SeqCst);
                     async move { attempt > 0 }
@@ -210,6 +213,7 @@ mod tests {
                 &active_tx,
                 Duration::from_secs(5),
                 Duration::from_secs(2),
+                |_| async {},
                 move |_| {
                     attempts_for_send.fetch_add(1, Ordering::SeqCst);
                     async { true }
@@ -234,7 +238,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(retries.load(Ordering::SeqCst), 1);
-        assert_eq!(last_retry_reason.load(Ordering::SeqCst), 3);
+        assert_eq!(last_retry_reason.load(Ordering::SeqCst), 2);
 
         let active = active_rx.borrow().clone().unwrap();
         active
@@ -261,6 +265,7 @@ mod tests {
                 &active_tx,
                 Duration::from_secs(5),
                 Duration::from_secs(2),
+                |_| async {},
                 |_| async { true },
                 |_, _| {},
             )
@@ -284,5 +289,100 @@ mod tests {
         };
         assert_eq!(confirmed.slot_landed, 42);
         assert_eq!(confirmed.latency, Instant::now() - started_at);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_send_is_not_cancelled_at_resend_interval() {
+        let (active_tx, active_rx) = watch::channel(None);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_send = Arc::clone(&attempts);
+        let completions = Arc::new(AtomicUsize::new(0));
+        let completions_for_send = Arc::clone(&completions);
+
+        let task = tokio::spawn(async move {
+            send_and_confirm(
+                [4; 64],
+                &active_tx,
+                Duration::from_secs(10),
+                Duration::from_secs(2),
+                |_| async {},
+                move |_| {
+                    attempts_for_send.fetch_add(1, Ordering::SeqCst);
+                    let completions_for_send = Arc::clone(&completions_for_send);
+                    async move {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        completions_for_send.fetch_add(1, Ordering::SeqCst);
+                        true
+                    }
+                },
+                |_, _| {},
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+
+        let active = active_rx.borrow().clone().unwrap();
+        active
+            .landed_tx
+            .try_send(LandedTransaction {
+                slot_landed: 45,
+                observed_at: Instant::now(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            SendAndConfirmOutcome::Confirmed(_)
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_before_first_send_is_excluded_from_latency() {
+        let (active_tx, active_rx) = watch::channel(None);
+
+        let task = tokio::spawn(async move {
+            send_and_confirm(
+                [5; 64],
+                &active_tx,
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+                |_| async {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                },
+                |_| async { true },
+                |_, _| {},
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(400)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(75)).await;
+
+        let active = active_rx.borrow().clone().unwrap();
+        active
+            .landed_tx
+            .try_send(LandedTransaction {
+                slot_landed: 46,
+                observed_at: Instant::now(),
+            })
+            .unwrap();
+
+        let SendAndConfirmOutcome::Confirmed(confirmed) = task.await.unwrap() else {
+            panic!("transaction should be confirmed");
+        };
+        assert_eq!(confirmed.latency, Duration::from_millis(75));
     }
 }
