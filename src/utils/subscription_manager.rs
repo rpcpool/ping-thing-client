@@ -98,10 +98,17 @@ fn notify_if_active_signature_matches(
     }
 
     let observed_at = Instant::now();
-    let _ = active_transaction.landed_tx.try_send(LandedTransaction {
+    let notified = active_transaction.landed_tx.try_send(LandedTransaction {
         slot_landed,
         observed_at,
     });
+    if notified.is_ok() {
+        info!(
+            "[Transaction Watcher] Matching transaction landed: signature={:?}, slot={:?}",
+            bs58::encode(transaction_signature).into_string(),
+            slot_landed
+        );
+    }
 }
 
 #[cfg(test)]

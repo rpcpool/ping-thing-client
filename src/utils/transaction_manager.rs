@@ -29,6 +29,19 @@ pub enum SendAndConfirmOutcome {
     TimedOut,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReason {
+    SendFailed,
+    SendTimedOut,
+    ConfirmationWaitExpired,
+}
+
+enum SendAttemptOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+}
+
 pub async fn send_and_confirm<F, Fut, R>(
     signature: TransactionSignatureBytes,
     active_transaction_tx: &watch::Sender<Option<ActiveTransaction>>,
@@ -38,9 +51,9 @@ pub async fn send_and_confirm<F, Fut, R>(
     mut record_retry: R,
 ) -> SendAndConfirmOutcome
 where
-    F: FnMut() -> Fut,
+    F: FnMut(u64) -> Fut,
     Fut: Future<Output = bool>,
-    R: FnMut(u64),
+    R: FnMut(u64, RetryReason),
 {
     let (landed_tx, mut landed_rx) = mpsc::channel(1);
     active_transaction_tx.send_replace(Some(ActiveTransaction {
@@ -51,6 +64,7 @@ where
     let send_started_at = Instant::now();
     let confirmation_deadline = send_started_at + confirmation_timeout;
     let mut retry_number = 0u64;
+    let mut attempt_number = 0u64;
 
     let outcome = 'confirmation: loop {
         if Instant::now() >= confirmation_deadline {
@@ -58,7 +72,8 @@ where
         }
 
         let send_deadline = (Instant::now() + resend_interval).min(confirmation_deadline);
-        let send_succeeded = tokio::select! {
+        attempt_number = attempt_number.saturating_add(1);
+        let send_outcome = tokio::select! {
             biased;
             Some(landed) = landed_rx.recv() => {
                 break 'confirmation confirmed_transaction(landed, send_started_at);
@@ -67,14 +82,25 @@ where
                 break 'confirmation SendAndConfirmOutcome::TimedOut;
             }
             _ = sleep_until(send_deadline) => {
-                false
+                SendAttemptOutcome::TimedOut
             }
-            result = send_transaction() => result,
+            result = send_transaction(attempt_number) => {
+                if result {
+                    SendAttemptOutcome::Succeeded
+                } else {
+                    SendAttemptOutcome::Failed
+                }
+            },
         };
 
-        if !send_succeeded {
+        if !matches!(send_outcome, SendAttemptOutcome::Succeeded) {
             retry_number = retry_number.saturating_add(1);
-            record_retry(retry_number);
+            let reason = match send_outcome {
+                SendAttemptOutcome::Failed => RetryReason::SendFailed,
+                SendAttemptOutcome::TimedOut => RetryReason::SendTimedOut,
+                SendAttemptOutcome::Succeeded => unreachable!("success was handled above"),
+            };
+            record_retry(retry_number, reason);
             tokio::task::yield_now().await;
             continue;
         }
@@ -90,7 +116,7 @@ where
             }
             _ = sleep_until(retry_at) => {
                 retry_number = retry_number.saturating_add(1);
-                record_retry(retry_number);
+                record_retry(retry_number, RetryReason::ConfirmationWaitExpired);
             }
         }
     };
@@ -119,6 +145,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    fn retry_reason_code(reason: RetryReason) -> usize {
+        match reason {
+            RetryReason::SendFailed => 1,
+            RetryReason::SendTimedOut => 2,
+            RetryReason::ConfirmationWaitExpired => 3,
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn retries_immediately_after_send_error() {
         let (active_tx, _active_rx) = watch::channel(None);
@@ -126,6 +160,8 @@ mod tests {
         let attempts_for_send = Arc::clone(&attempts);
         let retries = Arc::new(AtomicUsize::new(0));
         let retries_for_record = Arc::clone(&retries);
+        let last_retry_reason = Arc::new(AtomicUsize::new(0));
+        let last_retry_reason_for_record = Arc::clone(&last_retry_reason);
 
         let task = tokio::spawn(async move {
             send_and_confirm(
@@ -133,12 +169,13 @@ mod tests {
                 &active_tx,
                 Duration::from_secs(1),
                 Duration::from_millis(100),
-                move || {
+                move |_| {
                     let attempt = attempts_for_send.fetch_add(1, Ordering::SeqCst);
                     async move { attempt > 0 }
                 },
-                move |_| {
+                move |_, reason| {
                     retries_for_record.fetch_add(1, Ordering::SeqCst);
+                    last_retry_reason_for_record.store(retry_reason_code(reason), Ordering::SeqCst);
                 },
             )
             .await
@@ -148,6 +185,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(retries.load(Ordering::SeqCst), 1);
+        assert_eq!(last_retry_reason.load(Ordering::SeqCst), 1);
 
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(matches!(
@@ -163,6 +201,8 @@ mod tests {
         let attempts_for_send = Arc::clone(&attempts);
         let retries = Arc::new(AtomicUsize::new(0));
         let retries_for_record = Arc::clone(&retries);
+        let last_retry_reason = Arc::new(AtomicUsize::new(0));
+        let last_retry_reason_for_record = Arc::clone(&last_retry_reason);
 
         let task = tokio::spawn(async move {
             send_and_confirm(
@@ -170,12 +210,13 @@ mod tests {
                 &active_tx,
                 Duration::from_secs(5),
                 Duration::from_secs(2),
-                move || {
+                move |_| {
                     attempts_for_send.fetch_add(1, Ordering::SeqCst);
                     async { true }
                 },
-                move |_| {
+                move |_, reason| {
                     retries_for_record.fetch_add(1, Ordering::SeqCst);
+                    last_retry_reason_for_record.store(retry_reason_code(reason), Ordering::SeqCst);
                 },
             )
             .await
@@ -193,6 +234,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(retries.load(Ordering::SeqCst), 1);
+        assert_eq!(last_retry_reason.load(Ordering::SeqCst), 3);
 
         let active = active_rx.borrow().clone().unwrap();
         active
@@ -219,8 +261,8 @@ mod tests {
                 &active_tx,
                 Duration::from_secs(5),
                 Duration::from_secs(2),
-                || async { true },
-                |_| {},
+                |_| async { true },
+                |_, _| {},
             )
             .await
         });

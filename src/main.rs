@@ -31,7 +31,8 @@ use utils::{
     slot::{watch_slot, SlotSnapshot},
     subscription_manager::watch_transactions,
     transaction_manager::{
-        send_and_confirm, ActiveTransaction, SendAndConfirmOutcome, TransactionSignatureBytes,
+        send_and_confirm, ActiveTransaction, RetryReason, SendAndConfirmOutcome,
+        TransactionSignatureBytes,
     },
 };
 
@@ -716,31 +717,43 @@ fn current_priority_fee(
         .map_or(configured_fee, |snapshot| snapshot.value)
 }
 
-fn log_send_transaction_error(signature: &str, error_value: &SendTransactionRequestError) {
+fn retry_reason_name(reason: RetryReason) -> &'static str {
+    match reason {
+        RetryReason::SendFailed => "send failed",
+        RetryReason::SendTimedOut => "send timed out",
+        RetryReason::ConfirmationWaitExpired => "no gRPC confirmation after 2 seconds",
+    }
+}
+
+fn log_send_transaction_error(
+    signature: &str,
+    attempt_number: u64,
+    error_value: &SendTransactionRequestError,
+) {
     match error_value {
         SendTransactionRequestError::SendTransactionRequestFailed {
             endpoint,
             send_transaction_request_error,
         } => error!(
-            "[TX] Failed to send transaction for signature {:?} to endpoint {:?}: {:?}",
-            signature, endpoint, send_transaction_request_error
+            "[TX] Send attempt {:?} failed for signature {:?} to endpoint {:?}: {:?}",
+            attempt_number, signature, endpoint, send_transaction_request_error
         ),
         SendTransactionRequestError::SendTransactionResponseReadFailed {
             endpoint,
             send_transaction_response_read_error,
         } => error!(
-            "[TX] Failed to read sendTransaction response for signature {:?} from endpoint {:?}: {:?}",
-            signature, endpoint, send_transaction_response_read_error
+            "[TX] Failed to read sendTransaction response for attempt {:?}, signature {:?}, endpoint {:?}: {:?}",
+            attempt_number, signature, endpoint, send_transaction_response_read_error
         ),
         SendTransactionRequestError::RpcClientSendTransactionFailed {
             rpc_client_send_transaction_error,
         } => error!(
-            "[TX] Failed to send transaction for signature {:?} via RPC client: {:?}",
-            signature, rpc_client_send_transaction_error
+            "[TX] Send attempt {:?} failed for signature {:?} via RPC client: {:?}",
+            attempt_number, signature, rpc_client_send_transaction_error
         ),
         _ => error!(
-            "[TX] Failed to send transaction for signature {:?}: {:?}",
-            signature, error_value
+            "[TX] Send attempt {:?} failed for signature {:?}: {:?}",
+            attempt_number, signature, error_value
         ),
     }
 }
@@ -771,6 +784,12 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|e| e.endpoint.clone())
         .unwrap_or_else(|| rpc_endpoint.clone());
+    let transaction_send_kind = match configured_send_transaction_endpoint.as_ref() {
+        Some(endpoint) if endpoint.kind == SendTransactionEndpointKind::JsonRpc => "json_rpc",
+        Some(endpoint) if endpoint.kind == SendTransactionEndpointKind::TritonSendTx => "sendtx",
+        Some(_) => unreachable!("all send transaction endpoint kinds are handled"),
+        None => "rpc_client",
+    };
     info!(
         "TRANSACTION_SEND_ENDPOINT: {:?}",
         resolved_transaction_send_endpoint
@@ -785,6 +804,12 @@ async fn main() -> Result<()> {
     } else {
         info!("GRPC_X_TOKEN: [NOT SET]");
     }
+
+    let sleep_ms_loop = std::env::var("SLEEP_MS_LOOP")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse::<u64>()
+        .unwrap_or(0);
+    info!("SLEEP_MS_LOOP: {:?}ms", sleep_ms_loop);
 
     let txs_per_minute_limit = std::env::var("TXS_PER_MINUTE_LIMIT")
         .unwrap_or_else(|_| "10".to_string())
@@ -1102,16 +1127,43 @@ async fn main() -> Result<()> {
             tx_window_start = Instant::now();
         }
 
+        if sleep_ms_loop > 0 && tx_count > 0 {
+            info!(
+                "[TX] Sleeping {:?}ms before creating the next transaction",
+                sleep_ms_loop
+            );
+            tokio::time::sleep(Duration::from_millis(sleep_ms_loop)).await;
+        }
+
         if let Ok(watcher) = watcher_failure_rx.try_recv() {
             anyhow::bail!("{watcher} watcher stopped");
         }
 
-        let blockhash = wait_for_fresh_blockhash(&mut blockhash_rx).await?.value;
-        let slot_sent = wait_for_fresh_slot(&mut slot_rx).await?.value;
+        info!("[TX] Waiting for a fresh blockhash and slot");
+        let blockhash_wait = async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                wait_for_fresh_blockhash(&mut blockhash_rx),
+            )
+            .await
+            .context("timed out after 10 seconds waiting for a fresh blockhash")?
+        };
+        let slot_wait = async {
+            tokio::time::timeout(Duration::from_secs(10), wait_for_fresh_slot(&mut slot_rx))
+                .await
+                .context("timed out after 10 seconds waiting for a fresh slot")?
+        };
+        let (blockhash_snapshot, slot_snapshot) = tokio::try_join!(blockhash_wait, slot_wait)?;
+        let blockhash = blockhash_snapshot.value;
+        let slot_sent = slot_snapshot.value;
         let current_priority_fee = current_priority_fee(
             use_priority_fee,
             priority_fee_micro_lamports,
             &priority_fee_rx,
+        );
+        info!(
+            "[TX] Fresh inputs ready: slot={:?}, blockhash={:?}, priority_fee_micro_lamports={:?}",
+            slot_sent, blockhash, current_priority_fee
         );
 
         // Build transaction instructions
@@ -1133,6 +1185,13 @@ async fn main() -> Result<()> {
             .try_into()
             .context("transaction signature must be 64 bytes")?;
         tx_count += 1;
+        info!(
+            "[TX] Created transaction: signature={:?}, slot_sent={:?}, send_kind={:?}, endpoint={:?}",
+            signature,
+            slot_sent,
+            transaction_send_kind,
+            resolved_transaction_send_endpoint
+        );
 
         let outcome = tokio::select! {
             outcome = send_and_confirm(
@@ -1140,34 +1199,62 @@ async fn main() -> Result<()> {
                 &active_transaction_tx,
                 Duration::from_secs(tx_confirmation_timeout),
                 Duration::from_secs(2),
-                || async {
-                    match send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
-                        configured_send_transaction_endpoint.as_ref(),
-                        &send_transaction_http_client,
-                        rpc_client.as_ref(),
-                        &tx,
-                        RpcSendTransactionConfig {
-                            skip_preflight,
-                            max_retries: Some(0),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    {
-                        Ok(()) => true,
-                        Err(error_value) => {
-                            log_send_transaction_error(&signature, &error_value);
-                            false
+                |attempt_number| {
+                    let configured_send_transaction_endpoint =
+                        configured_send_transaction_endpoint.as_ref();
+                    let send_transaction_http_client = &send_transaction_http_client;
+                    let rpc_client = rpc_client.as_ref();
+                    let tx = &tx;
+                    let signature = &signature;
+                    async move {
+                        info!(
+                            "[TX] Sending transaction: signature={:?}, attempt={:?}",
+                            signature, attempt_number
+                        );
+                        match send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
+                            configured_send_transaction_endpoint,
+                            send_transaction_http_client,
+                            rpc_client,
+                            tx,
+                            RpcSendTransactionConfig {
+                                skip_preflight,
+                                max_retries: Some(0),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                info!(
+                                    "[TX] Send accepted: signature={:?}, attempt={:?}; waiting for gRPC confirmation",
+                                    signature, attempt_number
+                                );
+                                true
+                            }
+                            Err(error_value) => {
+                                log_send_transaction_error(
+                                    signature,
+                                    attempt_number,
+                                    &error_value,
+                                );
+                                false
+                            }
                         }
                     }
                 },
-                |retry_number| {
+                |retry_number, reason| {
                     if let Some(metrics) = &metrics {
                         metrics
                             .transaction_retries
                             .with_label_values(&[&pinger_name])
                             .observe(retry_number as f64);
                     }
+                    info!(
+                        "[TX] Scheduling retry: signature={:?}, retry={:?}, reason={}",
+                        signature,
+                        retry_number,
+                        retry_reason_name(reason)
+                    );
                 },
             ) => outcome,
             Some(watcher) = watcher_failure_rx.recv() => {
@@ -1215,12 +1302,16 @@ async fn main() -> Result<()> {
                 .observe(slot_latency as f64);
         }
 
-        debug!(
-            "[TX] Confirmed {:?}: {:?}ms, {:?} slots",
-            signature, time_latency_ms, slot_latency
+        info!(
+            "[TX] Confirmed transaction: signature={:?}, slot_sent={:?}, slot_landed={:?}, slot_latency={:?}, time_latency_ms={:?}",
+            signature, slot_sent, slot_landed, slot_latency, time_latency_ms
         );
 
         if !skip_validators_app {
+            info!(
+                "[TX] Dispatching Validators.app report: signature={:?}",
+                signature
+            );
             let validators_app_http_client = validators_app_http_client.clone();
             let va_api_key = va_api_key.clone();
             let metrics = metrics.clone();
@@ -1242,7 +1333,7 @@ async fn main() -> Result<()> {
                     "pinger_region": pinger_region,
                 });
 
-                if let Err(error_value) = send_validators_app_payload(
+                match send_validators_app_payload(
                     &validators_app_http_client,
                     &va_api_key,
                     &payload,
@@ -1250,18 +1341,31 @@ async fn main() -> Result<()> {
                 )
                 .await
                 {
-                    if let Some(metrics) = &metrics {
-                        metrics
-                            .validators_app_send_failures
-                            .with_label_values(&[&pinger_name])
-                            .inc();
+                    Ok(()) => {
+                        info!(
+                            "[TX] Validators.app report accepted: signature={:?}",
+                            signature
+                        );
                     }
-                    error!(
-                        "[TX] Error sending to Validators.app for signature {:?}: {:?}",
-                        signature, error_value
-                    );
+                    Err(error_value) => {
+                        if let Some(metrics) = &metrics {
+                            metrics
+                                .validators_app_send_failures
+                                .with_label_values(&[&pinger_name])
+                                .inc();
+                        }
+                        error!(
+                            "[TX] Error sending to Validators.app for signature {:?}: {:?}",
+                            signature, error_value
+                        );
+                    }
                 }
             });
+        } else {
+            info!(
+                "[TX] Validators.app report skipped: signature={:?}",
+                signature
+            );
         }
     }
 }
