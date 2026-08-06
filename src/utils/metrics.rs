@@ -12,7 +12,6 @@ pub struct Metrics {
     pub slot_latency: HistogramVec,
     pub watcher_up: IntGaugeVec,
     pub watcher_fatal_errors: IntCounterVec,
-    pub confirmation_channel_closed: IntCounterVec,
     pub transaction_timeouts: IntCounterVec,
     pub transaction_retries: HistogramVec,
     pub validators_app_send_failures: IntCounterVec,
@@ -83,14 +82,6 @@ impl Metrics {
             &["pinger_name", "watcher"],
         )?;
 
-        let confirmation_channel_closed = IntCounterVec::new(
-            Opts::new(
-                "ping_thing_client_confirmation_channel_closed_total",
-                "Times the transaction update channel closed",
-            ),
-            &["pinger_name"],
-        )?;
-
         let transaction_timeouts = IntCounterVec::new(
             Opts::new(
                 "ping_thing_client_transaction_timeouts_total",
@@ -122,7 +113,6 @@ impl Metrics {
         registry.register(Box::new(slot_latency.clone()))?;
         registry.register(Box::new(watcher_up.clone()))?;
         registry.register(Box::new(watcher_fatal_errors.clone()))?;
-        registry.register(Box::new(confirmation_channel_closed.clone()))?;
         registry.register(Box::new(transaction_timeouts.clone()))?;
         registry.register(Box::new(transaction_retries.clone()))?;
         registry.register(Box::new(validators_app_send_failures.clone()))?;
@@ -134,7 +124,6 @@ impl Metrics {
             slot_latency,
             watcher_up,
             watcher_fatal_errors,
-            confirmation_channel_closed,
             transaction_timeouts,
             transaction_retries,
             validators_app_send_failures,
@@ -192,10 +181,6 @@ mod tests {
             .with_label_values(&["test-pinger", "transaction"])
             .inc();
         metrics
-            .confirmation_channel_closed
-            .with_label_values(&["test-pinger"])
-            .inc();
-        metrics
             .transaction_timeouts
             .with_label_values(&["test-pinger"])
             .inc();
@@ -221,7 +206,6 @@ mod tests {
         assert!(rendered.contains("ping_thing_client_slot_latency"));
         assert!(rendered.contains("ping_thing_client_watcher_up"));
         assert!(rendered.contains("ping_thing_client_watcher_fatal_errors_total"));
-        assert!(rendered.contains("ping_thing_client_confirmation_channel_closed_total"));
         assert!(rendered.contains("ping_thing_client_transaction_timeouts_total"));
         assert!(rendered.contains("ping_thing_client_transaction_retries_bucket"));
         assert!(rendered.contains(

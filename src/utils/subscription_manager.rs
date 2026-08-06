@@ -3,19 +3,21 @@ use futures::StreamExt;
 use log::info;
 use solana_pubkey::Pubkey;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{oneshot, watch};
+use tokio::time::Instant;
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
     SubscribeRequestFilterTransactions,
 };
 
+use super::transaction_manager::{ActiveTransaction, LandedTransaction};
+
 /// Watches all transactions for a specific wallet pubkey via gRPC subscription
-/// Sends (signature, slot_landed, confirmed) tuples through the channel
 pub async fn watch_transactions(
-    grpc_client: Arc<Mutex<GeyserGrpcClient>>,
-    tx_updates_tx: mpsc::Sender<(String, u64, bool)>,
+    mut grpc_client: GeyserGrpcClient,
+    active_transaction_rx: watch::Receiver<Option<ActiveTransaction>>,
+    ready_tx: oneshot::Sender<()>,
     wallet_pubkey: Pubkey,
     commitment: CommitmentLevel,
 ) -> Result<()> {
@@ -45,51 +47,24 @@ pub async fn watch_transactions(
         ..Default::default()
     };
 
-    let mut stream = {
-        let mut client = grpc_client.lock().await;
-        client
-            .subscribe_once(subscribe_request)
-            .await
-            .context("Failed to create transaction subscription")?
-    };
+    let mut stream = grpc_client
+        .subscribe_once(subscribe_request)
+        .await
+        .context("Failed to create transaction subscription")?;
 
     info!("[Transaction Watcher] Successfully subscribed to transaction stream");
+    let _ = ready_tx.send(());
 
-    // Process stream updates
     while let Some(message) = stream.next().await {
         match message {
             Ok(msg) => {
                 if let Some(UpdateOneof::Transaction(tx_update)) = msg.update_oneof {
                     if let Some(transaction) = tx_update.transaction {
-                        let tx_signature = bs58::encode(&transaction.signature).into_string();
-                        let slot_landed = tx_update.slot;
-                        let confirmed = transaction
-                            .meta
-                            .as_ref()
-                            .is_some_and(|meta| meta.err.is_none());
-
-                        info!(
-                            "[Transaction Watcher] Transaction update - Signature: {:?}, Slot: {:?}, Confirmed: {:?}",
-                            tx_signature, slot_landed, confirmed
+                        notify_if_active_signature_matches(
+                            &transaction.signature,
+                            tx_update.slot,
+                            &active_transaction_rx,
                         );
-
-                        let transaction_signature_for_channel_send = tx_signature.clone();
-                        if let Err(e) = tx_updates_tx
-                            .send((
-                                transaction_signature_for_channel_send,
-                                slot_landed,
-                                confirmed,
-                            ))
-                            .await
-                        {
-                            return Err(anyhow::anyhow!(
-                                "[Transaction Watcher] Failed to send transaction update for signature {:?}, slot {:?}, confirmed {:?}: {:?}",
-                                tx_signature,
-                                slot_landed,
-                                confirmed,
-                                e
-                            ));
-                        }
                     }
                 }
             }
@@ -106,4 +81,47 @@ pub async fn watch_transactions(
         "[Transaction Watcher] Stream ended for wallet {:?}",
         wallet_pubkey
     ))
+}
+
+fn notify_if_active_signature_matches(
+    transaction_signature: &[u8],
+    slot_landed: u64,
+    active_transaction_rx: &watch::Receiver<Option<ActiveTransaction>>,
+) {
+    let active_transaction = active_transaction_rx.borrow();
+    let Some(active_transaction) = active_transaction.as_ref() else {
+        return;
+    };
+
+    if transaction_signature != active_transaction.signature {
+        return;
+    }
+
+    let observed_at = Instant::now();
+    let _ = active_transaction.landed_tx.try_send(LandedTransaction {
+        slot_landed,
+        observed_at,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn only_matching_signature_is_reported_as_landed() {
+        let (landed_tx, mut landed_rx) = mpsc::channel(1);
+        let (_active_tx, active_rx) = watch::channel(Some(ActiveTransaction {
+            signature: [7; 64],
+            landed_tx,
+        }));
+
+        notify_if_active_signature_matches(&[8; 64], 10, &active_rx);
+        assert!(landed_rx.try_recv().is_err());
+
+        notify_if_active_signature_matches(&[7; 64], 11, &active_rx);
+        let landed = landed_rx.recv().await.unwrap();
+        assert_eq!(landed.slot_landed, 11);
+    }
 }
