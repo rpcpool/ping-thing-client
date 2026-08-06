@@ -1203,6 +1203,7 @@ async fn main() -> Result<()> {
         let mut confirmed = false;
         let mut slot_landed = 0u64;
         let mut is_success = false;
+        let mut transaction_retry_count = 0u64;
 
         let start_time = Instant::now();
 
@@ -1261,6 +1262,13 @@ async fn main() -> Result<()> {
                 }
                 Err(_) => {
                     // Timeout elapsed (2 seconds passed), resend transaction
+                    transaction_retry_count = transaction_retry_count.saturating_add(1);
+                    if let Some(ref metrics) = metrics {
+                        metrics
+                            .transaction_retries
+                            .with_label_values(&[&pinger_name])
+                            .observe(transaction_retry_count as f64);
+                    }
                     info!("[TX] Resending transaction: {:?}", signature);
                     match send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
                         configured_send_transaction_endpoint.as_ref(),

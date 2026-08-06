@@ -14,6 +14,7 @@ pub struct Metrics {
     pub watcher_fatal_errors: IntCounterVec,
     pub confirmation_channel_closed: IntCounterVec,
     pub transaction_timeouts: IntCounterVec,
+    pub transaction_retries: HistogramVec,
     pub validators_app_send_failures: IntCounterVec,
 }
 
@@ -98,6 +99,16 @@ impl Metrics {
             &["pinger_name"],
         )?;
 
+        let transaction_retry_buckets: Vec<f64> = (1..=30).map(|retry| retry as f64).collect();
+        let transaction_retries = HistogramVec::new(
+            HistogramOpts::new(
+                "ping_thing_client_transaction_retries",
+                "Retry number observed each time a transaction is resent",
+            )
+            .buckets(transaction_retry_buckets),
+            &["pinger_name"],
+        )?;
+
         let validators_app_send_failures = IntCounterVec::new(
             Opts::new(
                 "ping_thing_client_validators_app_send_failures_total",
@@ -113,6 +124,7 @@ impl Metrics {
         registry.register(Box::new(watcher_fatal_errors.clone()))?;
         registry.register(Box::new(confirmation_channel_closed.clone()))?;
         registry.register(Box::new(transaction_timeouts.clone()))?;
+        registry.register(Box::new(transaction_retries.clone()))?;
         registry.register(Box::new(validators_app_send_failures.clone()))?;
         info!("[Metrics] All metrics registered successfully");
 
@@ -124,6 +136,7 @@ impl Metrics {
             watcher_fatal_errors,
             confirmation_channel_closed,
             transaction_timeouts,
+            transaction_retries,
             validators_app_send_failures,
         })
     }
@@ -187,6 +200,14 @@ mod tests {
             .with_label_values(&["test-pinger"])
             .inc();
         metrics
+            .transaction_retries
+            .with_label_values(&["test-pinger"])
+            .observe(1.0);
+        metrics
+            .transaction_retries
+            .with_label_values(&["test-pinger"])
+            .observe(2.0);
+        metrics
             .validators_app_send_failures
             .with_label_values(&["test-pinger"])
             .inc();
@@ -202,6 +223,12 @@ mod tests {
         assert!(rendered.contains("ping_thing_client_watcher_fatal_errors_total"));
         assert!(rendered.contains("ping_thing_client_confirmation_channel_closed_total"));
         assert!(rendered.contains("ping_thing_client_transaction_timeouts_total"));
+        assert!(rendered.contains("ping_thing_client_transaction_retries_bucket"));
+        assert!(rendered.contains(
+            "ping_thing_client_transaction_retries_count{pinger_name=\"test-pinger\"} 2"
+        ));
+        assert!(rendered
+            .contains("ping_thing_client_transaction_retries_sum{pinger_name=\"test-pinger\"} 3"));
         assert!(rendered.contains("ping_thing_client_validators_app_send_failures_total"));
     }
 }
