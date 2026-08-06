@@ -53,7 +53,7 @@ impl Metrics {
         )?;
 
         info!("[Metrics] Creating histogram buckets for slot latency...");
-        let slot_buckets: Vec<f64> = (1..=30).map(|x| x as f64).collect();
+        let slot_buckets: Vec<f64> = (0..=30).map(f64::from).collect();
         debug!(
             "[Metrics] Created {:?} buckets for slot latency",
             slot_buckets.len()
@@ -210,6 +210,10 @@ mod tests {
         metrics
             .slot_latency
             .with_label_values(&["test-pinger"])
+            .observe(0.0);
+        metrics
+            .slot_latency
+            .with_label_values(&["test-pinger"])
             .observe(1.0);
         metrics
             .watcher_up
@@ -255,6 +259,12 @@ mod tests {
         let rendered = String::from_utf8(buffer).unwrap();
         assert!(rendered.contains("ping_thing_client_confirmation_latency"));
         assert!(rendered.contains("ping_thing_client_slot_latency"));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("ping_thing_client_slot_latency_bucket{")
+                && line.contains("le=\"0\"")
+                && line.contains("pinger_name=\"test-pinger\"")
+                && line.ends_with(" 1")
+        }));
         assert!(rendered.contains("ping_thing_client_watcher_up"));
         assert!(rendered.contains("ping_thing_client_watcher_fatal_errors_total"));
         assert!(rendered.contains("ping_thing_client_transaction_timeouts_total"));
