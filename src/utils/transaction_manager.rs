@@ -108,7 +108,10 @@ where
             continue;
         }
 
-        let retry_at = (Instant::now() + resend_interval).min(confirmation_deadline);
+        let retry_at = Instant::now()
+            .checked_add(resend_interval)
+            .unwrap_or(confirmation_deadline)
+            .min(confirmation_deadline);
         tokio::select! {
             biased;
             Some(landed) = landed_rx.recv() => {
@@ -384,5 +387,31 @@ mod tests {
             panic!("transaction should be confirmed");
         };
         assert_eq!(confirmed.latency, Duration::from_millis(75));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_resend_interval_uses_confirmation_deadline() {
+        let (active_tx, _active_rx) = watch::channel(None);
+
+        let task = tokio::spawn(async move {
+            send_and_confirm(
+                [6; 64],
+                &active_tx,
+                Duration::from_secs(1),
+                Duration::MAX,
+                |_| async {},
+                |_| async { true },
+                |_, _| {},
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            task.await.unwrap(),
+            SendAndConfirmOutcome::TimedOut
+        ));
     }
 }

@@ -38,6 +38,8 @@ use utils::{
 };
 
 const USE_MEMO_IX_WITH_STRING_ENV_VAR: &str = "USE_MEMO_IX_WITH_STRING";
+const TX_RESEND_INTERVAL_MS_ENV_VAR: &str = "TX_RESEND_INTERVAL_MS";
+const DEFAULT_TX_RESEND_INTERVAL_MS: u64 = 2_000;
 
 fn memo_string_from_environment() -> Result<Option<String>> {
     match std::env::var(USE_MEMO_IX_WITH_STRING_ENV_VAR) {
@@ -662,6 +664,21 @@ fn validators_app_request_timeout_from_environment() -> tokio::time::Duration {
     tokio::time::Duration::from_millis(timeout_ms)
 }
 
+fn parse_tx_resend_interval_ms(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_TX_RESEND_INTERVAL_MS);
+    };
+
+    let interval_ms = value.parse::<u64>().with_context(|| {
+        format!("{TX_RESEND_INTERVAL_MS_ENV_VAR} must be a positive integer in milliseconds")
+    })?;
+    if interval_ms == 0 {
+        anyhow::bail!("{TX_RESEND_INTERVAL_MS_ENV_VAR} must be greater than zero");
+    }
+
+    Ok(interval_ms)
+}
+
 async fn wait_for_watcher_ready(ready_rx: oneshot::Receiver<()>, watcher: &str) -> Result<()> {
     ready_rx
         .await
@@ -722,7 +739,7 @@ async fn wait_for_priority_fee(
 fn retry_reason_name(reason: RetryReason) -> &'static str {
     match reason {
         RetryReason::SendFailed => "send failed",
-        RetryReason::ConfirmationWaitExpired => "no gRPC confirmation after 2 seconds",
+        RetryReason::ConfirmationWaitExpired => "gRPC confirmation wait expired",
     }
 }
 
@@ -842,6 +859,13 @@ async fn main() -> Result<()> {
         .parse::<u64>()
         .unwrap_or(60);
     info!("TX_CONFIRMATION_TIMEOUT: {:?}s", tx_confirmation_timeout);
+
+    let tx_resend_interval_value = std::env::var(TX_RESEND_INTERVAL_MS_ENV_VAR).ok();
+    let tx_resend_interval_ms = parse_tx_resend_interval_ms(tx_resend_interval_value.as_deref())?;
+    info!(
+        "{}: {:?}ms",
+        TX_RESEND_INTERVAL_MS_ENV_VAR, tx_resend_interval_ms
+    );
 
     let use_priority_fee = std::env::var("USE_PRIORITY_FEE")
         .map(|v| v == "true")
@@ -1225,7 +1249,7 @@ async fn main() -> Result<()> {
                 signature_bytes,
                 &active_transaction_tx,
                 Duration::from_secs(tx_confirmation_timeout),
-                Duration::from_secs(2),
+                Duration::from_millis(tx_resend_interval_ms),
                 |attempt_number| {
                     let signature = &signature;
                     async move {
@@ -1294,10 +1318,11 @@ async fn main() -> Result<()> {
                             .observe(retry_number as f64);
                     }
                     info!(
-                        "[TX] Scheduling retry: signature={:?}, retry={:?}, reason={}",
+                        "[TX] Scheduling retry: signature={:?}, retry={:?}, reason={}, resend_interval_ms={:?}",
                         signature,
                         retry_number,
-                        retry_reason_name(reason)
+                        retry_reason_name(reason),
+                        tx_resend_interval_ms
                     );
                 },
             ) => outcome,
@@ -1419,6 +1444,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tx_resend_interval_defaults_to_two_seconds() {
+        assert_eq!(
+            parse_tx_resend_interval_ms(None).unwrap(),
+            DEFAULT_TX_RESEND_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn tx_resend_interval_accepts_custom_milliseconds() {
+        assert_eq!(parse_tx_resend_interval_ms(Some("750")).unwrap(), 750);
+    }
+
+    #[test]
+    fn tx_resend_interval_rejects_invalid_value() {
+        let error_value = parse_tx_resend_interval_ms(Some("fast")).unwrap_err();
+
+        assert!(error_value
+            .to_string()
+            .contains(TX_RESEND_INTERVAL_MS_ENV_VAR));
+    }
+
+    #[test]
+    fn tx_resend_interval_rejects_zero() {
+        let error_value = parse_tx_resend_interval_ms(Some("0")).unwrap_err();
+
+        assert!(error_value.to_string().contains("greater than zero"));
+    }
+
+    #[test]
     fn sendtx_plain_signature_response_is_parsed() {
         let signature = "5h6JYJ57QvpPvhAkZML12MS2EUp6vbrZEn7zR1pC3skD";
         assert_eq!(
@@ -1492,16 +1546,18 @@ mod tests {
     }
 
     #[test]
-    fn grafana_dashboard_contains_local_delay_panels() {
+    fn grafana_dashboard_contains_retry_panels_without_removed_panels() {
         let dashboard: Value = serde_json::from_str(include_str!("../grafana-pt.json")).unwrap();
 
         assert_eq!(
-            dashboard["elements"]["panel-10"]["spec"]["title"],
-            "p95 Local Transaction Delays"
+            dashboard["elements"]["panel-12"]["spec"]["title"],
+            "Transaction Retries Over Time"
         );
         assert_eq!(
-            dashboard["elements"]["panel-11"]["spec"]["title"],
-            "Priority Fee Cache Age"
+            dashboard["elements"]["panel-9"]["spec"]["title"],
+            "Transaction Retry Attempts Heatmap"
         );
+        assert!(dashboard["elements"]["panel-10"].is_null());
+        assert!(dashboard["elements"]["panel-11"].is_null());
     }
 }
