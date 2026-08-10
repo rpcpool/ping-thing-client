@@ -1,6 +1,6 @@
 [package]
 name = "ping-thing-client-rust"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 
 [[bin]]
@@ -36,10 +36,12 @@ serde_json = "1.0.145"
 prometheus = "0.14.0"
 warp = { version = "0.4.2", features = ["server"] }
 anyhow = "1.0.100"
-chrono = "0.4.42"
 tonic = "0.14.2"
 prost = "0.14.1"
 prost-types = "0.14.1"
 futures = "0.3.31"
-yellowstone-grpc-client = "10.1.1"
-yellowstone-grpc-proto = "10.1.1"
+yellowstone-grpc-client = "13.2.0"
+yellowstone-grpc-proto = "12.5.0"
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["test-util"] }

@@ -1,6 +1,6 @@
 mod utils;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use dotenv::dotenv;
@@ -9,6 +9,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_hash::Hash;
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_message::Message;
@@ -18,22 +19,27 @@ use solana_system_interface::instruction as system_instruction;
 use solana_transaction::Transaction;
 use solana_transaction_status::UiTransactionEncoding;
 use spl_memo_interface::{instruction as memo_instruction, v3 as memo_program};
-use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
-use tokio::sync::{mpsc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
 use utils::{
-    blockhash::{watch_blockhash, GlobalBlockhash},
+    blockhash::{watch_blockhash, BlockhashSnapshot},
     grpc_client::{create_grpc_client, parse_commitment},
     metrics::Metrics,
-    misc::sleep_ms,
-    priority_fees::{watch_prioritization_fees, GlobalPriorityFees},
-    slot::{watch_slot, GlobalSlotSent},
+    priority_fees::{watch_prioritization_fees, PriorityFeeSnapshot},
+    slot::{watch_slot, SlotSnapshot},
     subscription_manager::watch_transactions,
+    transaction_manager::{
+        send_and_confirm, ActiveTransaction, RetryReason, SendAndConfirmOutcome,
+        TransactionSignatureBytes,
+    },
 };
 
 const USE_MEMO_IX_WITH_STRING_ENV_VAR: &str = "USE_MEMO_IX_WITH_STRING";
+const TX_RESEND_INTERVAL_MS_ENV_VAR: &str = "TX_RESEND_INTERVAL_MS";
+const DEFAULT_TX_RESEND_INTERVAL_MS: u64 = 2_000;
 
 fn memo_string_from_environment() -> Result<Option<String>> {
     match std::env::var(USE_MEMO_IX_WITH_STRING_ENV_VAR) {
@@ -297,30 +303,6 @@ fn configured_send_transaction_endpoint_from_environment(
         response_signature,
         forwarding_policies,
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sendtx_plain_signature_response_is_parsed() {
-        let signature = "5h6JYJ57QvpPvhAkZML12MS2EUp6vbrZEn7zR1pC3skD";
-        assert_eq!(
-            signature_from_sendtx_response("http://sendtx", signature).unwrap(),
-            signature
-        );
-    }
-
-    #[test]
-    fn sendtx_json_signature_response_is_parsed() {
-        let signature = "5h6JYJ57QvpPvhAkZML12MS2EUp6vbrZEn7zR1pC3skD";
-        let response_body = format!(r#"{{"signature":"{}"}}"#, signature);
-        assert_eq!(
-            signature_from_sendtx_response("http://sendtx", &response_body).unwrap(),
-            signature
-        );
-    }
 }
 
 async fn send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
@@ -624,6 +606,176 @@ fn validate_response_signature(
     Ok(())
 }
 
+async fn send_validators_app_payload(
+    client: &Client,
+    va_api_key: &str,
+    payload: &Value,
+    request_timeout: tokio::time::Duration,
+) -> Result<()> {
+    let request = async {
+        let response = client
+            .post("https://www.validators.app/api/v1/ping-thing/mainnet")
+            .header("Content-Type", "application/json")
+            .header("Token", va_api_key)
+            .json(payload)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let response_body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("failed to read response body: {error:?}"));
+        Err(anyhow::anyhow!("status {status}: {response_body}"))
+    };
+
+    tokio::time::timeout(request_timeout, request)
+        .await
+        .map_err(|_| anyhow::anyhow!("request timed out after {:?}", request_timeout))?
+}
+
+fn set_watcher_up(metrics: Option<&Arc<Metrics>>, pinger_name: &str, watcher: &str, is_up: bool) {
+    if let Some(metrics) = metrics {
+        metrics
+            .watcher_up
+            .with_label_values(&[pinger_name, watcher])
+            .set(i64::from(is_up));
+    }
+}
+
+fn record_watcher_fatal_error(metrics: Option<&Arc<Metrics>>, pinger_name: &str, watcher: &str) {
+    if let Some(metrics) = metrics {
+        metrics
+            .watcher_fatal_errors
+            .with_label_values(&[pinger_name, watcher])
+            .inc();
+    }
+}
+
+fn validators_app_request_timeout_from_environment() -> tokio::time::Duration {
+    let timeout_ms = std::env::var("VALIDATORS_APP_REQUEST_TIMEOUT_MS")
+        .unwrap_or_else(|_| "5000".to_string())
+        .parse::<u64>()
+        .unwrap_or(5000);
+    tokio::time::Duration::from_millis(timeout_ms)
+}
+
+fn parse_tx_resend_interval_ms(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_TX_RESEND_INTERVAL_MS);
+    };
+
+    let interval_ms = value.parse::<u64>().with_context(|| {
+        format!("{TX_RESEND_INTERVAL_MS_ENV_VAR} must be a positive integer in milliseconds")
+    })?;
+    if interval_ms == 0 {
+        anyhow::bail!("{TX_RESEND_INTERVAL_MS_ENV_VAR} must be greater than zero");
+    }
+
+    Ok(interval_ms)
+}
+
+async fn wait_for_watcher_ready(ready_rx: oneshot::Receiver<()>, watcher: &str) -> Result<()> {
+    ready_rx
+        .await
+        .with_context(|| format!("{watcher} watcher stopped before subscribing"))
+}
+
+async fn wait_for_new_blockhash(
+    blockhash_rx: &mut watch::Receiver<Option<BlockhashSnapshot>>,
+    last_used_blockhash: Option<Hash>,
+) -> Result<BlockhashSnapshot> {
+    const MAX_AGE: Duration = Duration::from_secs(10);
+
+    loop {
+        let snapshot = *blockhash_rx.borrow_and_update();
+        if let Some(snapshot) = snapshot.filter(|value| {
+            value.observed_at.elapsed() < MAX_AGE && Some(value.value) != last_used_blockhash
+        }) {
+            return Ok(snapshot);
+        }
+
+        blockhash_rx
+            .changed()
+            .await
+            .context("blockhash watcher stopped")?;
+    }
+}
+
+async fn wait_for_fresh_slot(
+    slot_rx: &mut watch::Receiver<Option<SlotSnapshot>>,
+) -> Result<SlotSnapshot> {
+    const MAX_AGE: Duration = Duration::from_secs(10);
+
+    loop {
+        let snapshot = *slot_rx.borrow_and_update();
+        if let Some(snapshot) = snapshot.filter(|value| value.observed_at.elapsed() < MAX_AGE) {
+            return Ok(snapshot);
+        }
+
+        slot_rx.changed().await.context("slot watcher stopped")?;
+    }
+}
+
+async fn wait_for_priority_fee(
+    priority_fee_rx: &mut watch::Receiver<Option<PriorityFeeSnapshot>>,
+) -> Result<PriorityFeeSnapshot> {
+    loop {
+        if let Some(snapshot) = *priority_fee_rx.borrow_and_update() {
+            return Ok(snapshot);
+        }
+
+        priority_fee_rx
+            .changed()
+            .await
+            .context("priority fee watcher stopped before returning a value")?;
+    }
+}
+
+fn retry_reason_name(reason: RetryReason) -> &'static str {
+    match reason {
+        RetryReason::SendFailed => "send failed",
+        RetryReason::ConfirmationWaitExpired => "gRPC confirmation wait expired",
+    }
+}
+
+fn log_send_transaction_error(
+    signature: &str,
+    attempt_number: u64,
+    error_value: &SendTransactionRequestError,
+) {
+    match error_value {
+        SendTransactionRequestError::SendTransactionRequestFailed {
+            endpoint,
+            send_transaction_request_error,
+        } => error!(
+            "[TX] Send attempt {:?} failed for signature {:?} to endpoint {:?}: {:?}",
+            attempt_number, signature, endpoint, send_transaction_request_error
+        ),
+        SendTransactionRequestError::SendTransactionResponseReadFailed {
+            endpoint,
+            send_transaction_response_read_error,
+        } => error!(
+            "[TX] Failed to read sendTransaction response for attempt {:?}, signature {:?}, endpoint {:?}: {:?}",
+            attempt_number, signature, endpoint, send_transaction_response_read_error
+        ),
+        SendTransactionRequestError::RpcClientSendTransactionFailed {
+            rpc_client_send_transaction_error,
+        } => error!(
+            "[TX] Send attempt {:?} failed for signature {:?} via RPC client: {:?}",
+            attempt_number, signature, rpc_client_send_transaction_error
+        ),
+        _ => error!(
+            "[TX] Send attempt {:?} failed for signature {:?}: {:?}",
+            attempt_number, signature, error_value
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     info!("=== Starting Ping Thing Client ===");
@@ -650,6 +802,12 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|e| e.endpoint.clone())
         .unwrap_or_else(|| rpc_endpoint.clone());
+    let transaction_send_kind = match configured_send_transaction_endpoint.as_ref() {
+        Some(endpoint) if endpoint.kind == SendTransactionEndpointKind::JsonRpc => "json_rpc",
+        Some(endpoint) if endpoint.kind == SendTransactionEndpointKind::TritonSendTx => "sendtx",
+        Some(_) => unreachable!("all send transaction endpoint kinds are handled"),
+        None => "rpc_client",
+    };
     info!(
         "TRANSACTION_SEND_ENDPOINT: {:?}",
         resolved_transaction_send_endpoint
@@ -702,23 +860,21 @@ async fn main() -> Result<()> {
         .unwrap_or(60);
     info!("TX_CONFIRMATION_TIMEOUT: {:?}s", tx_confirmation_timeout);
 
+    let tx_resend_interval_value = std::env::var(TX_RESEND_INTERVAL_MS_ENV_VAR).ok();
+    let tx_resend_interval_ms = parse_tx_resend_interval_ms(tx_resend_interval_value.as_deref())?;
+    info!(
+        "{}: {:?}ms",
+        TX_RESEND_INTERVAL_MS_ENV_VAR, tx_resend_interval_ms
+    );
+
     let use_priority_fee = std::env::var("USE_PRIORITY_FEE")
         .map(|v| v == "true")
         .unwrap_or(false);
     info!("USE_PRIORITY_FEE: {:?}", use_priority_fee);
 
-    let priority_fee_micro_lamports = if use_priority_fee {
-        std::env::var("PRIORITY_FEE_MICRO_LAMPORTS")
-            .unwrap_or_else(|_| "5000".to_string())
-            .parse::<u64>()
-            .unwrap_or(5000)
-    } else {
-        0
-    };
-    info!(
-        "PRIORITY_FEE_MICRO_LAMPORTS: {:?}",
-        priority_fee_micro_lamports
-    );
+    if use_priority_fee {
+        info!("Priority fee source: latest successful RPC response");
+    }
 
     let pinger_region = std::env::var("PINGER_REGION").expect("PINGER_REGION must be set");
     info!("PINGER_REGION: {:?}", pinger_region);
@@ -727,6 +883,12 @@ async fn main() -> Result<()> {
         .map(|v| v == "true")
         .unwrap_or(false);
     info!("SKIP_VALIDATORS_APP: {:?}", skip_validators_app);
+
+    let validators_app_request_timeout = validators_app_request_timeout_from_environment();
+    info!(
+        "VALIDATORS_APP_REQUEST_TIMEOUT_MS: {:?}",
+        validators_app_request_timeout.as_millis()
+    );
 
     let skip_prometheus = std::env::var("SKIP_PROMETHEUS")
         .map(|v| v == "true")
@@ -761,13 +923,7 @@ async fn main() -> Result<()> {
 
     let rpc_client = Arc::new(RpcClient::new(rpc_endpoint.clone()));
     let send_transaction_http_client = Client::new();
-
-    let g_blockhash = Arc::new(Mutex::new(GlobalBlockhash::new()));
-    let g_slot_sent = Arc::new(Mutex::new(GlobalSlotSent::new()));
-    let g_priority_fees = Arc::new(Mutex::new(GlobalPriorityFees::new()));
-    // HashMap: key = signature, value = (slot_sent, send_time)
-    let sent_transactions: Arc<RwLock<HashMap<String, (u64, Instant)>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let validators_app_http_client = Client::new();
 
     let keypair_bytes: Vec<u8> = bs58::decode(
         std::env::var("WALLET_PRIVATE_KEYPAIR").expect("WALLET_PRIVATE_KEYPAIR must be set"),
@@ -817,15 +973,41 @@ async fn main() -> Result<()> {
         info!("Prometheus metrics server task spawned");
     }
 
-    let grpc_client = create_grpc_client(&grpc_endpoint, grpc_x_token.clone()).await?;
-    let shared_grpc_client = Arc::new(Mutex::new(grpc_client));
+    let grpc_client = create_grpc_client(&grpc_endpoint, grpc_x_token).await?;
+    let grpc_client_blockhash = grpc_client.clone();
+    let grpc_client_slot = grpc_client.clone();
+    let grpc_client_transactions = grpc_client;
 
-    // Spawn blockhash watching task
-    let g_blockhash_clone = Arc::clone(&g_blockhash);
-    let grpc_client_blockhash = Arc::clone(&shared_grpc_client);
-    tokio::spawn(async move {
-        if let Err(e) = watch_blockhash(grpc_client_blockhash, g_blockhash_clone, commitment).await
-        {
+    let (blockhash_tx, mut blockhash_rx) = watch::channel(None);
+    let (slot_tx, mut slot_rx) = watch::channel(None);
+    let (priority_fee_tx, mut priority_fee_rx) = watch::channel(None);
+    let (active_transaction_tx, active_transaction_rx) =
+        watch::channel::<Option<ActiveTransaction>>(None);
+    let (watcher_failure_tx, mut watcher_failure_rx) = mpsc::unbounded_channel::<String>();
+
+    let (blockhash_ready_tx, blockhash_ready_rx) = oneshot::channel();
+    let blockhash_metrics = metrics.clone();
+    let blockhash_pinger_name = pinger_name.clone();
+    let blockhash_handle = tokio::spawn(async move {
+        let result = watch_blockhash(
+            grpc_client_blockhash,
+            blockhash_tx,
+            blockhash_ready_tx,
+            commitment,
+        )
+        .await;
+        set_watcher_up(
+            blockhash_metrics.as_ref(),
+            &blockhash_pinger_name,
+            "blockhash",
+            false,
+        );
+        if let Err(e) = result {
+            record_watcher_fatal_error(
+                blockhash_metrics.as_ref(),
+                &blockhash_pinger_name,
+                "blockhash",
+            );
             error!(
                 "[Blockhash Watcher] Task failed for commitment {:?}: {:?}",
                 commitment, e
@@ -834,11 +1016,14 @@ async fn main() -> Result<()> {
     });
     info!("Blockhash watching task spawned");
 
-    // Spawn slot watching task
-    let g_slot_sent_clone = Arc::clone(&g_slot_sent);
-    let grpc_client_slot = Arc::clone(&shared_grpc_client);
-    tokio::spawn(async move {
-        if let Err(e) = watch_slot(grpc_client_slot, g_slot_sent_clone, commitment).await {
+    let (slot_ready_tx, slot_ready_rx) = oneshot::channel();
+    let slot_metrics = metrics.clone();
+    let slot_pinger_name = pinger_name.clone();
+    let slot_handle = tokio::spawn(async move {
+        let result = watch_slot(grpc_client_slot, slot_tx, slot_ready_tx, commitment).await;
+        set_watcher_up(slot_metrics.as_ref(), &slot_pinger_name, "slot", false);
+        if let Err(e) = result {
+            record_watcher_fatal_error(slot_metrics.as_ref(), &slot_pinger_name, "slot");
             error!(
                 "[Slot Watcher] Task failed for commitment {:?}: {:?}",
                 commitment, e
@@ -848,40 +1033,50 @@ async fn main() -> Result<()> {
     info!("Slot watching task spawned");
 
     if use_priority_fee {
-        let g_priority_fees_clone = Arc::clone(&g_priority_fees);
+        let priority_fee_rpc_endpoint = rpc_endpoint.clone();
         tokio::spawn(async move {
             if let Err(e) = watch_prioritization_fees(
-                &rpc_endpoint,
-                g_priority_fees_clone,
+                priority_fee_rpc_endpoint.clone(),
+                priority_fee_tx,
                 priority_fee_percentile,
             )
             .await
             {
                 error!(
                     "[Priority Fees Watcher] Task failed for endpoint {:?}: {:?}",
-                    rpc_endpoint, e
+                    priority_fee_rpc_endpoint, e
                 );
             }
         });
         info!("Priority fees watching task spawned");
     } else {
-        info!("Priority fees watching task skipped (USE_PRIORITY_FEE=true)");
+        info!("Priority fees watching task skipped (USE_PRIORITY_FEE=false)");
     }
 
-    // Create channel for transaction confirmations: (signature, slot_landed, confirmed)
-    let (tx_updates_tx, mut tx_updates_rx) = mpsc::channel::<(String, u64, bool)>(100);
-
-    // Spawn transaction watching task for the wallet
-    let grpc_client_transactions = Arc::clone(&shared_grpc_client);
-    tokio::spawn(async move {
-        if let Err(e) = watch_transactions(
+    let (transaction_ready_tx, transaction_ready_rx) = oneshot::channel();
+    let transaction_metrics = metrics.clone();
+    let transaction_pinger_name = pinger_name.clone();
+    let transaction_handle = tokio::spawn(async move {
+        let result = watch_transactions(
             grpc_client_transactions,
-            tx_updates_tx,
+            active_transaction_rx,
+            transaction_ready_tx,
             wallet_pubkey,
             commitment,
         )
-        .await
-        {
+        .await;
+        set_watcher_up(
+            transaction_metrics.as_ref(),
+            &transaction_pinger_name,
+            "transaction",
+            false,
+        );
+        if let Err(e) = result {
+            record_watcher_fatal_error(
+                transaction_metrics.as_ref(),
+                &transaction_pinger_name,
+                "transaction",
+            );
             error!(
                 "[Transaction Watcher] Task failed for wallet {:?}: {:?}",
                 wallet_pubkey, e
@@ -889,99 +1084,137 @@ async fn main() -> Result<()> {
         }
     });
     info!("Transaction watching task spawned");
+
+    let supervisor_metrics = metrics.clone();
+    let supervisor_pinger_name = pinger_name.clone();
+    tokio::spawn(async move {
+        let (watcher, result) = tokio::select! {
+            result = blockhash_handle => ("blockhash", result),
+            result = slot_handle => ("slot", result),
+            result = transaction_handle => ("transaction", result),
+        };
+
+        if let Err(error_value) = result {
+            record_watcher_fatal_error(
+                supervisor_metrics.as_ref(),
+                &supervisor_pinger_name,
+                watcher,
+            );
+            error!("[{watcher} Watcher] Task panicked: {error_value:?}");
+        }
+        let _ = watcher_failure_tx.send(watcher.to_string());
+    });
+
+    tokio::try_join!(
+        wait_for_watcher_ready(blockhash_ready_rx, "blockhash"),
+        wait_for_watcher_ready(slot_ready_rx, "slot"),
+        wait_for_watcher_ready(transaction_ready_rx, "transaction"),
+    )?;
+    set_watcher_up(metrics.as_ref(), &pinger_name, "blockhash", true);
+    set_watcher_up(metrics.as_ref(), &pinger_name, "slot", true);
+    set_watcher_up(metrics.as_ref(), &pinger_name, "transaction", true);
+
+    if use_priority_fee {
+        info!("[Priority Fees] Waiting for the first RPC value");
+        let first_priority_fee = tokio::select! {
+            result = wait_for_priority_fee(&mut priority_fee_rx) => result?,
+            Some(watcher) = watcher_failure_rx.recv() => {
+                anyhow::bail!("{watcher} watcher stopped");
+            }
+        };
+        info!(
+            "[Priority Fees] Initial value cached: priority_fee_micro_lamports={:?}",
+            first_priority_fee.value
+        );
+    }
+
     info!("=== Entering main transaction loop ===");
 
-    let tx_window_duration = std::time::Duration::from_secs(60);
+    let tx_window_duration = Duration::from_secs(60);
     let mut tx_count: u64 = 0;
     let mut tx_window_start = Instant::now();
+    let mut last_used_blockhash = None;
 
     loop {
-        if sleep_ms_loop > 0 {
-            info!(
-                "Sleeping {:?}ms before next transaction cycle",
-                sleep_ms_loop
-            );
-            sleep_ms(sleep_ms_loop).await;
-        }
-
         if tx_window_start.elapsed() >= tx_window_duration {
             tx_count = 0;
             tx_window_start = Instant::now();
-            info!("[TX] Rate limit window reset");
         }
 
         if tx_count >= txs_per_minute_limit {
-            let elapsed = tx_window_start.elapsed();
-            let wait_duration = tx_window_duration.saturating_sub(elapsed);
-            let wait_ms = wait_duration.as_millis() as u64;
+            let reset_at = tx_window_start + tx_window_duration;
             info!(
-                "[TX] Rate limit reached ({:?} per minute). Waiting {:?}ms for reset",
-                txs_per_minute_limit, wait_ms
+                "[TX] Rate limit reached ({:?} per minute). Waiting for reset",
+                txs_per_minute_limit
             );
-            sleep_ms(wait_ms).await;
+            tokio::select! {
+                _ = tokio::time::sleep_until(reset_at) => {}
+                Some(watcher) = watcher_failure_rx.recv() => {
+                    anyhow::bail!("{watcher} watcher stopped");
+                }
+            }
             tx_count = 0;
             tx_window_start = Instant::now();
-            info!("[TX] Rate limit window reset after wait");
         }
 
-        info!("=== Starting new transaction cycle ===");
+        if sleep_ms_loop > 0 && tx_count > 0 {
+            info!(
+                "[TX] Sleeping {:?}ms before creating the next transaction",
+                sleep_ms_loop
+            );
+            tokio::time::sleep(Duration::from_millis(sleep_ms_loop)).await;
+        }
 
-        // Wait for fresh slot and blockhash
-        let (blockhash, slot_sent) = loop {
-            let now = chrono::Utc::now().timestamp();
-            let g_blockhash = g_blockhash.lock().await;
-            let g_slot = g_slot_sent.lock().await;
+        if let Ok(watcher) = watcher_failure_rx.try_recv() {
+            anyhow::bail!("{watcher} watcher stopped");
+        }
 
-            // Calculate time since last update for both (in seconds)
-            let blockhash_time_since = now - g_blockhash.updated_at;
-            let slot_time_since = now - g_slot.updated_at;
-
-            // Panic if either blockhash or slot hasn't been updated for more than 10 seconds
-            if blockhash_time_since >= 10 || slot_time_since >= 10 {
-                error!(
-                    "[PANIC] Blockhash or slot not updated within 10 seconds! \
-                     Blockhash time since last update: {:?}s, Slot time since last update: {:?}s",
-                    blockhash_time_since, slot_time_since
-                );
-                panic!(
-                    "Blockhash or slot stale for more than 10 seconds. \
-                     Blockhash: {}s since last update, Slot: {}s since last update. \
-                     Exiting process.",
-                    blockhash_time_since, slot_time_since
-                );
+        info!("[TX] Waiting for a new blockhash and fresh slot");
+        let blockhash_wait = async {
+            let wait_started_at = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                wait_for_new_blockhash(&mut blockhash_rx, last_used_blockhash),
+            )
+            .await;
+            if let Some(metrics) = &metrics {
+                metrics
+                    .blockhash_wait_duration
+                    .with_label_values(&[&pinger_name])
+                    .observe(wait_started_at.elapsed().as_secs_f64() * 1_000.0);
             }
-
-            if now - g_blockhash.updated_at < 10000 && now - g_slot.updated_at < 50 {
-                break (g_blockhash.value, g_slot.value);
-            }
-
-            drop(g_blockhash);
-            drop(g_slot);
-            sleep_ms(1).await;
+            result.context("timed out after 10 seconds waiting for a new blockhash")?
         };
-
-        let blockhash = match blockhash {
-            Some(h) => h,
-            None => {
-                warn!("Blockhash not available, skipping transaction cycle");
-                continue;
-            }
+        let slot_wait = async {
+            tokio::time::timeout(Duration::from_secs(10), wait_for_fresh_slot(&mut slot_rx))
+                .await
+                .context("timed out after 10 seconds waiting for a fresh slot")?
         };
-
-        let slot_sent = match slot_sent {
-            Some(s) => s,
-            None => {
-                warn!("Slot not available, skipping transaction cycle");
-                continue;
-            }
-        };
-
-        let current_priority_fee = if use_priority_fee {
-            let g_fees = g_priority_fees.lock().await;
-            g_fees.value.unwrap_or(0)
+        let (blockhash_snapshot, slot_snapshot) = tokio::try_join!(blockhash_wait, slot_wait)?;
+        let blockhash = blockhash_snapshot.value;
+        let slot_sent = slot_snapshot.value;
+        let priority_fee_snapshot = if use_priority_fee {
+            Some(
+                priority_fee_rx
+                    .borrow()
+                    .as_ref()
+                    .copied()
+                    .context("priority fee cache unexpectedly empty")?,
+            )
         } else {
-            0 // USE_PRIORITY_FEE=true, so set fees to 0
+            None
         };
+        let current_priority_fee = priority_fee_snapshot.map_or(0, |snapshot| snapshot.value);
+        if let (Some(metrics), Some(snapshot)) = (&metrics, priority_fee_snapshot) {
+            metrics
+                .priority_fee_cache_age
+                .with_label_values(&[&pinger_name])
+                .set(snapshot.observed_at.elapsed().as_secs_f64() * 1_000.0);
+        }
+        info!(
+            "[TX] Fresh inputs ready: slot={:?}, blockhash={:?}, priority_fee_micro_lamports={:?}",
+            slot_sent, blockhash, current_priority_fee
+        );
 
         // Build transaction instructions
         let instructions = build_transaction_instructions(
@@ -995,214 +1228,166 @@ async fn main() -> Result<()> {
         let message =
             Message::new_with_blockhash(&instructions, Some(&wallet_keypair.pubkey()), &blockhash);
         let tx = Transaction::new(&[&wallet_keypair], message, blockhash);
+        last_used_blockhash = Some(blockhash);
 
-        // Get signature from transaction
         let signature = tx.signatures[0].to_string();
-        info!("[TX] Transaction created with signature: {:?}", signature);
-
-        // Send transaction initially
-        info!("[TX] Sending initial transaction: {:?}", signature);
-        let send_time = Instant::now();
-        match send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
-            configured_send_transaction_endpoint.as_ref(),
-            &send_transaction_http_client,
-            rpc_client.as_ref(),
-            &tx,
-            RpcSendTransactionConfig {
-                skip_preflight,
-                max_retries: Some(0),
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            Ok(_) => {
-                info!("[TX] Successfully sent initial transaction");
-            }
-            Err(send_transaction_request_error) => match &send_transaction_request_error {
-                SendTransactionRequestError::SendTransactionRequestFailed {
-                    endpoint,
-                    send_transaction_request_error,
-                } => {
-                    error!(
-                        "[TX] Failed to send initial transaction for signature {:?} to endpoint {:?}: {:?}",
-                        signature, endpoint, send_transaction_request_error
-                    );
-                }
-                SendTransactionRequestError::SendTransactionResponseReadFailed {
-                    endpoint,
-                    send_transaction_response_read_error,
-                } => {
-                    error!(
-                        "[TX] Failed to read sendTransaction response for signature {:?} from endpoint {:?}: {:?}",
-                        signature, endpoint, send_transaction_response_read_error
-                    );
-                }
-                SendTransactionRequestError::RpcClientSendTransactionFailed {
-                    rpc_client_send_transaction_error,
-                } => {
-                    error!(
-                        "[TX] Failed to send initial transaction for signature {:?} via RPC client: {:?}",
-                        signature, rpc_client_send_transaction_error
-                    );
-                }
-                _ => {
-                    error!(
-                        "[TX] Failed to send initial transaction for signature {:?}: {:?}",
-                        signature, send_transaction_request_error
-                    );
-                }
-            },
-        }
-        // Count only initial sends; resends are not counted
+        let signature_bytes: TransactionSignatureBytes = tx.signatures[0]
+            .as_ref()
+            .try_into()
+            .context("transaction signature must be 64 bytes")?;
         tx_count += 1;
+        info!(
+            "[TX] Created transaction: signature={:?}, slot_sent={:?}, send_kind={:?}, endpoint={:?}",
+            signature,
+            slot_sent,
+            transaction_send_kind,
+            resolved_transaction_send_endpoint
+        );
 
-        // Store signature and slot in sent_transactions map
-        {
-            let mut sent = sent_transactions.write().unwrap();
-            sent.insert(signature.clone(), (slot_sent, send_time));
-        }
-        info!("[TX] Stored transaction in sent_transactions map");
-
-        // Start 20-second resend loop with confirmation handling
-        info!("[TX] Starting resend loop (20 second timeout)...");
-        let timeout_duration = tokio::time::Duration::from_secs(20);
-        let resend_interval_duration = tokio::time::Duration::from_millis(2000);
-
-        let mut confirmed = false;
-        let mut slot_landed = 0u64;
-        let mut is_success = false;
-
-        let start_time = Instant::now();
-
-        loop {
-            // Check if timeout elapsed
-            if start_time.elapsed() >= timeout_duration {
-                warn!(
-                    "[TX] Transaction {:?} timed out after 20 seconds",
-                    signature
-                );
-                break;
-            }
-
-            // Try to receive confirmation with timeout for resend interval
-            match tokio::time::timeout(resend_interval_duration, tx_updates_rx.recv()).await {
-                Ok(Some((conf_signature, conf_slot_landed, conf_success))) => {
-                    // Received a confirmation notification
-                    if conf_signature == signature {
-                        // This is the confirmation for our current transaction
+        let outcome = tokio::select! {
+            outcome = send_and_confirm(
+                signature_bytes,
+                &active_transaction_tx,
+                Duration::from_secs(tx_confirmation_timeout),
+                Duration::from_millis(tx_resend_interval_ms),
+                |attempt_number| {
+                    let signature = &signature;
+                    async move {
                         info!(
-                            "[TX] Confirmation received for transaction: {:?}",
-                            signature
-                        );
-                        confirmed = true;
-                        slot_landed = conf_slot_landed;
-                        is_success = conf_success;
-                        break; // Exit resend loop
-                    } else {
-                        // This is a confirmation for a different transaction, ignore it
-                        debug!(
-                            "[TX] Received confirmation for different transaction: {:?}, current: {:?}",
-                            conf_signature, signature
+                            "[TX] Sending transaction: signature={:?}, attempt={:?}",
+                            signature, attempt_number
                         );
                     }
-                }
-                Ok(None) => {
-                    // Channel closed
-                    error!(
-                        "[TX] Transaction update channel closed unexpectedly for signature: {:?}",
-                        signature
-                    );
-                    break;
-                }
-                Err(_) => {
-                    // Timeout elapsed (2 seconds passed), resend transaction
-                    info!("[TX] Resending transaction: {:?}", signature);
-                    match send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
-                        configured_send_transaction_endpoint.as_ref(),
-                        &send_transaction_http_client,
-                        rpc_client.as_ref(),
-                        &tx,
-                        RpcSendTransactionConfig {
-                            skip_preflight,
-                            max_retries: Some(0),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            debug!("[TX] Successfully resent transaction");
+                },
+                |attempt_number| {
+                    let configured_send_transaction_endpoint =
+                        configured_send_transaction_endpoint.as_ref();
+                    let send_transaction_http_client = &send_transaction_http_client;
+                    let rpc_client = rpc_client.as_ref();
+                    let tx = &tx;
+                    let signature = &signature;
+                    let metrics = metrics.as_ref();
+                    let pinger_name = &pinger_name;
+                    async move {
+                        let send_request_started_at = Instant::now();
+                        let result = send_transaction_using_configured_send_transaction_endpoint_or_rpc_client(
+                            configured_send_transaction_endpoint,
+                            send_transaction_http_client,
+                            rpc_client,
+                            tx,
+                            RpcSendTransactionConfig {
+                                skip_preflight,
+                                max_retries: Some(0),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                        if let Some(metrics) = metrics {
+                            let outcome = if result.is_ok() { "success" } else { "failure" };
+                            metrics
+                                .send_request_duration
+                                .with_label_values(&[pinger_name, transaction_send_kind, outcome])
+                                .observe(
+                                    send_request_started_at.elapsed().as_secs_f64() * 1_000.0,
+                                );
                         }
-                        Err(send_transaction_request_error) => match &send_transaction_request_error
-                        {
-                            SendTransactionRequestError::SendTransactionRequestFailed {
-                                endpoint,
-                                send_transaction_request_error,
-                            } => {
-                                error!(
-                                    "[TX] Failed to resend transaction for signature {:?} to endpoint {:?}: {:?}",
-                                    signature, endpoint, send_transaction_request_error
+                        match result {
+                            Ok(()) => {
+                                info!(
+                                    "[TX] Send accepted: signature={:?}, attempt={:?}; waiting for gRPC confirmation",
+                                    signature, attempt_number
                                 );
+                                true
                             }
-                            SendTransactionRequestError::SendTransactionResponseReadFailed {
-                                endpoint,
-                                send_transaction_response_read_error,
-                            } => {
-                                error!(
-                                    "[TX] Failed to read sendTransaction response for resend signature {:?} from endpoint {:?}: {:?}",
-                                    signature, endpoint, send_transaction_response_read_error
+                            Err(error_value) => {
+                                log_send_transaction_error(
+                                    signature,
+                                    attempt_number,
+                                    &error_value,
                                 );
+                                false
                             }
-                            SendTransactionRequestError::RpcClientSendTransactionFailed {
-                                rpc_client_send_transaction_error,
-                            } => {
-                                error!(
-                                    "[TX] Failed to resend transaction for signature {:?} via RPC client: {:?}",
-                                    signature, rpc_client_send_transaction_error
-                                );
-                            }
-                            _ => {
-                                error!(
-                                    "[TX] Failed to resend transaction for signature {:?}: {:?}",
-                                    signature, send_transaction_request_error
-                                );
-                            }
-                        },
+                        }
                     }
-                }
+                },
+                |retry_number, reason| {
+                    if let Some(metrics) = &metrics {
+                        metrics
+                            .transaction_retries
+                            .with_label_values(&[&pinger_name])
+                            .observe(retry_number as f64);
+                    }
+                    info!(
+                        "[TX] Scheduling retry: signature={:?}, retry={:?}, reason={}, resend_interval_ms={:?}",
+                        signature,
+                        retry_number,
+                        retry_reason_name(reason),
+                        tx_resend_interval_ms
+                    );
+                },
+            ) => outcome,
+            Some(watcher) = watcher_failure_rx.recv() => {
+                anyhow::bail!("{watcher} watcher stopped");
             }
+        };
+
+        let SendAndConfirmOutcome::Confirmed(confirmed) = outcome else {
+            if let Some(metrics) = &metrics {
+                metrics
+                    .transaction_timeouts
+                    .with_label_values(&[&pinger_name])
+                    .inc();
+            }
+            warn!(
+                "[TX] Transaction {:?} timed out after {:?} seconds",
+                signature, tx_confirmation_timeout
+            );
+            continue;
+        };
+
+        let time_latency_ms = u64::try_from(confirmed.latency.as_millis()).unwrap_or(u64::MAX);
+        let slot_landed = confirmed.slot_landed;
+
+        if let Some(metrics) = &metrics {
+            metrics
+                .confirmation_latency
+                .with_label_values(&[&pinger_name])
+                .observe(time_latency_ms as f64);
+        }
+
+        if slot_landed < slot_sent {
+            error!(
+                "[TX] Slot {:?} < {:?} for signature {:?}. Not sending to Validators.app",
+                slot_landed, slot_sent, signature
+            );
+            continue;
+        }
+
+        let slot_latency = slot_landed - slot_sent;
+        if let Some(metrics) = &metrics {
+            metrics
+                .slot_latency
+                .with_label_values(&[&pinger_name])
+                .observe(slot_latency as f64);
         }
 
         info!(
-            "[TX] Exited resend loop - Confirmed: {:?}, Success: {:?}",
-            confirmed, is_success
+            "[TX] Confirmed transaction: signature={:?}, slot_sent={:?}, slot_landed={:?}, slot_latency={:?}, time_latency_ms={:?}",
+            signature, slot_sent, slot_landed, slot_latency, time_latency_ms
         );
 
-        // Get send data from sent_transactions map
-        let (stored_slot_sent, stored_send_time) = {
-            let sent = sent_transactions.read().unwrap();
-            sent.get(&signature).copied()
-        }
-        .unwrap_or((slot_sent, send_time));
-
-        // Calculate latencies
-        let time_latency_ms = stored_send_time.elapsed().as_millis() as u64;
-
-        if confirmed && is_success {
-            let slot_latency = slot_landed.saturating_sub(stored_slot_sent);
+        if !skip_validators_app {
             info!(
-                "[TX] Transaction confirmed - Signature: {:?}, Slot latency: {:?} (landed: {:?}, sent: {:?}), Time latency: {:?}ms",
-                signature, slot_latency, slot_landed, stored_slot_sent, time_latency_ms
+                "[TX] Dispatching Validators.app report: signature={:?}",
+                signature
             );
-
-            // Validate slot ordering
-            if slot_landed < stored_slot_sent {
-                error!(
-                    "[TX] ERROR: Slot {:?} < {:?}. Not sending to Validators.app",
-                    slot_landed, stored_slot_sent
-                );
-            } else {
+            let validators_app_http_client = validators_app_http_client.clone();
+            let va_api_key = va_api_key.clone();
+            let metrics = metrics.clone();
+            let pinger_name = pinger_name.clone();
+            let commitment_str = commitment_str.clone();
+            let pinger_region = pinger_region.clone();
+            tokio::spawn(async move {
                 let payload = json!({
                     "time": time_latency_ms,
                     "signature": signature,
@@ -1210,71 +1395,169 @@ async fn main() -> Result<()> {
                     "success": true,
                     "application": "web3",
                     "commitment_level": commitment_str,
-                    "slot_sent": stored_slot_sent.to_string(),
+                    "slot_sent": slot_sent.to_string(),
                     "slot_landed": slot_landed.to_string(),
                     "priority_fee_micro_lamports": current_priority_fee.to_string(),
-                    "priority_fee_percentile": priority_fee_percentile/100,
+                    "priority_fee_percentile": priority_fee_percentile / 100,
                     "pinger_region": pinger_region,
                 });
 
-                info!("[TX] VA Payload {:?}", payload);
-
-                if !skip_validators_app {
-                    info!("[TX] Sending metrics to Validators.app...");
-
-                    let client = Client::new();
-                    match client
-                        .post("https://www.validators.app/api/v1/ping-thing/mainnet")
-                        .header("Content-Type", "application/json")
-                        .header("Token", &va_api_key)
-                        .json(&payload)
-                        .send()
-                        .await
-                    {
-                        Ok(response) => {
-                            if response.status().is_success() {
-                                info!("[TX] Successfully sent metrics to Validators.app");
-                            } else {
-                                error!(
-                                    "[TX] Failed to send to Validators.app for signature {:?} - Status: {:?}",
-                                    signature, response.status()
-                                );
-                            }
+                match send_validators_app_payload(
+                    &validators_app_http_client,
+                    &va_api_key,
+                    &payload,
+                    validators_app_request_timeout,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        info!(
+                            "[TX] Validators.app report accepted: signature={:?}",
+                            signature
+                        );
+                    }
+                    Err(error_value) => {
+                        if let Some(metrics) = &metrics {
+                            metrics
+                                .validators_app_send_failures
+                                .with_label_values(&[&pinger_name])
+                                .inc();
                         }
-                        Err(e) => {
-                            error!(
-                                "[TX] Error sending to Validators.app for signature {:?}: {:?}",
-                                signature, e
-                            );
-                        }
+                        error!(
+                            "[TX] Error sending to Validators.app for signature {:?}: {:?}",
+                            signature, error_value
+                        );
                     }
                 }
-
-                // Update Prometheus metrics
-                if let Some(ref metrics) = metrics {
-                    metrics
-                        .confirmation_latency
-                        .with_label_values(&[&pinger_name])
-                        .observe(time_latency_ms as f64);
-                    metrics
-                        .slot_latency
-                        .with_label_values(&[&pinger_name])
-                        .observe(slot_latency as f64);
-                }
-            }
+            });
         } else {
-            warn!(
-                "[TX] Transaction {:?} not confirmed or failed after 20 seconds",
+            info!(
+                "[TX] Validators.app report skipped: signature={:?}",
                 signature
             );
         }
+    }
+}
 
-        // Remove from sent_transactions
-        {
-            let mut sent = sent_transactions.write().unwrap();
-            sent.remove(&signature);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        info!("=== Transaction cycle completed ===");
+    #[test]
+    fn tx_resend_interval_defaults_to_two_seconds() {
+        assert_eq!(
+            parse_tx_resend_interval_ms(None).unwrap(),
+            DEFAULT_TX_RESEND_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn tx_resend_interval_accepts_custom_milliseconds() {
+        assert_eq!(parse_tx_resend_interval_ms(Some("750")).unwrap(), 750);
+    }
+
+    #[test]
+    fn tx_resend_interval_rejects_invalid_value() {
+        let error_value = parse_tx_resend_interval_ms(Some("fast")).unwrap_err();
+
+        assert!(error_value
+            .to_string()
+            .contains(TX_RESEND_INTERVAL_MS_ENV_VAR));
+    }
+
+    #[test]
+    fn tx_resend_interval_rejects_zero() {
+        let error_value = parse_tx_resend_interval_ms(Some("0")).unwrap_err();
+
+        assert!(error_value.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn sendtx_plain_signature_response_is_parsed() {
+        let signature = "5h6JYJ57QvpPvhAkZML12MS2EUp6vbrZEn7zR1pC3skD";
+        assert_eq!(
+            signature_from_sendtx_response("http://sendtx", signature).unwrap(),
+            signature
+        );
+    }
+
+    #[test]
+    fn sendtx_json_signature_response_is_parsed() {
+        let signature = "5h6JYJ57QvpPvhAkZML12MS2EUp6vbrZEn7zR1pC3skD";
+        let response_body = format!(r#"{{"signature":"{}"}}"#, signature);
+        assert_eq!(
+            signature_from_sendtx_response("http://sendtx", &response_body).unwrap(),
+            signature
+        );
+    }
+
+    #[tokio::test]
+    async fn same_blockhash_waits_until_a_new_value_arrives() {
+        let first_hash = Hash::new_from_array([1; 32]);
+        let second_hash = Hash::new_from_array([2; 32]);
+        let (blockhash_tx, mut blockhash_rx) = watch::channel(Some(BlockhashSnapshot {
+            value: first_hash,
+            observed_at: Instant::now(),
+        }));
+
+        let task = tokio::spawn(async move {
+            wait_for_new_blockhash(&mut blockhash_rx, Some(first_hash)).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        blockhash_tx.send_replace(Some(BlockhashSnapshot {
+            value: second_hash,
+            observed_at: Instant::now(),
+        }));
+
+        let snapshot = task.await.unwrap().unwrap();
+        assert_eq!(snapshot.value, second_hash);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_priority_fee_does_not_expire() {
+        let snapshot = PriorityFeeSnapshot {
+            value: 42_000,
+            observed_at: Instant::now(),
+        };
+        let (_priority_fee_tx, mut priority_fee_rx) = watch::channel(Some(snapshot));
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let cached = wait_for_priority_fee(&mut priority_fee_rx).await.unwrap();
+
+        assert_eq!(cached.value, snapshot.value);
+        assert_eq!(cached.observed_at, snapshot.observed_at);
+    }
+
+    #[tokio::test]
+    async fn priority_fee_waits_for_first_rpc_value() {
+        let (priority_fee_tx, mut priority_fee_rx) = watch::channel(None);
+        let task = tokio::spawn(async move { wait_for_priority_fee(&mut priority_fee_rx).await });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        priority_fee_tx.send_replace(Some(PriorityFeeSnapshot {
+            value: 51_000,
+            observed_at: Instant::now(),
+        }));
+
+        assert_eq!(task.await.unwrap().unwrap().value, 51_000);
+    }
+
+    #[test]
+    fn grafana_dashboard_contains_retry_panels_without_removed_panels() {
+        let dashboard: Value = serde_json::from_str(include_str!("../grafana-pt.json")).unwrap();
+
+        assert_eq!(
+            dashboard["elements"]["panel-12"]["spec"]["title"],
+            "Transaction Retries Over Time"
+        );
+        assert_eq!(
+            dashboard["elements"]["panel-9"]["spec"]["title"],
+            "Transaction Retry Attempts Heatmap"
+        );
+        assert!(dashboard["elements"]["panel-10"].is_null());
+        assert!(dashboard["elements"]["panel-11"].is_null());
     }
 }

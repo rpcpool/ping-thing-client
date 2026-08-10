@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use tonic::transport::ClientTlsConfig;
-use yellowstone_grpc_client::{GeyserGrpcClient, Interceptor};
+use yellowstone_grpc_client::{GeyserGrpcClient, ReconnectConfig};
 use yellowstone_grpc_proto::prelude::CommitmentLevel;
 
 /// Creates a gRPC client with proper configuration
@@ -9,7 +9,7 @@ use yellowstone_grpc_proto::prelude::CommitmentLevel;
 pub async fn create_grpc_client(
     endpoint: &str,
     x_token: Option<String>,
-) -> Result<GeyserGrpcClient<impl Interceptor>> {
+) -> Result<GeyserGrpcClient> {
     info!("[gRPC Client] Creating client for endpoint: {:?}", endpoint);
 
     // Always use TLS config with native roots (works for both http and https)
@@ -22,7 +22,8 @@ pub async fn create_grpc_client(
     let builder = GeyserGrpcClient::build_from_shared(endpoint.to_string())
         .context("Failed to build gRPC client")?
         .tls_config(tls_config)
-        .context("Failed to configure TLS")?;
+        .context("Failed to configure TLS")?
+        .set_reconnect_config(ReconnectConfig::default());
     debug!("[gRPC Client] Client builder created with TLS config");
 
     // Add x-token header if provided

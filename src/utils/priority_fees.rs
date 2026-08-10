@@ -3,22 +3,13 @@ use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::sync::watch;
+use tokio::time::{sleep, Duration, Instant};
 
-#[derive(Debug)]
-pub struct GlobalPriorityFees {
-    pub value: Option<u64>,
-    pub updated_at: i64,
-}
-
-impl GlobalPriorityFees {
-    pub fn new() -> Self {
-        Self {
-            value: None,
-            updated_at: 0,
-        }
-    }
+#[derive(Debug, Clone, Copy)]
+pub struct PriorityFeeSnapshot {
+    pub value: u64,
+    pub observed_at: Instant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,8 +31,8 @@ struct RpcResponse {
 
 /// Watches prioritization fees by polling RPC every 350ms
 pub async fn watch_prioritization_fees(
-    rpc_endpoint: &String,
-    g_priority_fees: Arc<tokio::sync::Mutex<GlobalPriorityFees>>,
+    rpc_endpoint: String,
+    priority_fee_tx: watch::Sender<Option<PriorityFeeSnapshot>>,
     percentile: u16,
 ) -> Result<()> {
     info!(
@@ -66,7 +57,7 @@ pub async fn watch_prioritization_fees(
         });
 
         match client
-            .post(rpc_endpoint)
+            .post(&rpc_endpoint)
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()
@@ -78,22 +69,21 @@ pub async fn watch_prioritization_fees(
                         Ok(rpc_response) => {
                             // Process the fee results
                             if !rpc_response.result.is_empty() {
-                                let mut fees: Vec<u64> = rpc_response
+                                let Some(max_fee) = rpc_response
                                     .result
                                     .iter()
                                     .map(|f| f.prioritization_fee)
-                                    .collect();
+                                    .max()
+                                else {
+                                    continue;
+                                };
 
-                                // Sort fees and get the maximum
-                                fees.sort();
-                                let max_fee = fees[fees.len() - 1];
-
-                                // Update global state
-                                let mut g = g_priority_fees.lock().await;
-                                let previous_fee = g.value;
-                                g.value = Some(max_fee);
-                                g.updated_at = chrono::Utc::now().timestamp();
-                                drop(g);
+                                let previous_fee =
+                                    priority_fee_tx.borrow().as_ref().map(|fee| fee.value);
+                                priority_fee_tx.send_replace(Some(PriorityFeeSnapshot {
+                                    value: max_fee,
+                                    observed_at: Instant::now(),
+                                }));
 
                                 if previous_fee != Some(max_fee) {
                                     debug!(
