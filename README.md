@@ -98,6 +98,7 @@ curl http://127.0.0.1:${PROMETHEUS_PORT}/metrics
 | `RUST_LOG` | `info` | Log filter used by `env_logger`. |
 | `TXS_PER_MINUTE_LIMIT` | `10` | Maximum number of new logical transactions created in each fixed 60-second window. Retries do not increment this count. |
 | `TX_RESEND_INTERVAL_MS` | `2000` | Wait after a successful send before resending an unconfirmed transaction. Send errors retry immediately. Must be greater than zero. |
+| `LAMPORTS_MULTIPLIER` | `1.0,2.0` | Range with which lamports to transfer are multiplied to ensure unique transactions. |
 
 The program also supports advanced send settings such as `SEND_TX_ENCODING`, `SEND_TX_MAX_RETRIES`, `SEND_TX_RESPONSE_SIGNATURE`, and `SEND_TX_FORWARDING_POLICIES`. It supports `TX_CONFIRMATION_TIMEOUT`, `SKIP_PREFLIGHT`, `SKIP_PROMETHEUS`, `VALIDATORS_APP_REQUEST_TIMEOUT_MS`, and the optional `USE_MEMO_IX_WITH_STRING` memo.
 
