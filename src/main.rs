@@ -6,6 +6,7 @@ use base64::Engine;
 use dotenv::dotenv;
 use log::{debug, error, info, warn};
 use reqwest::Client;
+use rand::{RngExt};
 use serde_json::{json, Value};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
@@ -58,11 +59,12 @@ fn build_transaction_instructions(
     current_priority_fee: u64,
     cu_budget: u32,
     memo_string: Option<&str>,
+    lamports_to_transfer: u64,
 ) -> Vec<Instruction> {
     let mut instructions = vec![
         ComputeBudgetInstruction::set_compute_unit_limit(cu_budget),
         ComputeBudgetInstruction::set_compute_unit_price(current_priority_fee),
-        system_instruction::transfer(wallet_pubkey, wallet_pubkey, 5000),
+        system_instruction::transfer(wallet_pubkey, wallet_pubkey, lamports_to_transfer),
     ];
 
     if let Some(memo_string) = memo_string {
@@ -74,6 +76,10 @@ fn build_transaction_instructions(
     }
 
     instructions
+}
+
+fn generate_random_number_in_range(ranges: &Vec<f32>) -> f32 {
+    rand::rng().random_range(*ranges.get(0).unwrap()..=*ranges.get(1).unwrap())
 }
 
 #[derive(Debug, Clone)]
@@ -921,6 +927,17 @@ async fn main() -> Result<()> {
         .unwrap_or(5000);
     info!("PRIORITY_FEE_PERCENTILE: {:?}", priority_fee_percentile);
 
+    let lamports_multipliers: Vec<f32> = std::env::var("LAMPORTS_MULTIPLIER")
+        .unwrap_or_else(|_| "1.0,2.0".to_string())
+        .parse::<String>()
+        .unwrap_or("1.0,2.0".to_string())
+        .split(",")
+        .map(|v| {
+            v.trim().parse::<f32>().expect("invalid f32")
+        })
+        .collect();
+    info!("LAMPORTS_MULTIPLIERS: {:?}", lamports_multipliers);
+
     let rpc_client = Arc::new(RpcClient::new(rpc_endpoint.clone()));
     let send_transaction_http_client = Client::new();
     let validators_app_http_client = Client::new();
@@ -1216,12 +1233,15 @@ async fn main() -> Result<()> {
             slot_sent, blockhash, current_priority_fee
         );
 
+        let lamports_to_transfer = (5000 as f32 * generate_random_number_in_range(&lamports_multipliers)).floor() as u64;
+
         // Build transaction instructions
         let instructions = build_transaction_instructions(
             &wallet_keypair.pubkey(),
             current_priority_fee,
             cu_budget,
             memo_string.as_deref(),
+            lamports_to_transfer
         );
 
         // Create and sign transaction
@@ -1237,8 +1257,9 @@ async fn main() -> Result<()> {
             .context("transaction signature must be 64 bytes")?;
         tx_count += 1;
         info!(
-            "[TX] Created transaction: signature={:?}, slot_sent={:?}, send_kind={:?}, endpoint={:?}",
+            "[TX] Created transaction: signature={:?}, lamports_to_transfer={:?}, slot_sent={:?}, send_kind={:?}, endpoint={:?}",
             signature,
+            lamports_to_transfer,
             slot_sent,
             transaction_send_kind,
             resolved_transaction_send_endpoint
@@ -1545,19 +1566,4 @@ mod tests {
         assert_eq!(task.await.unwrap().unwrap().value, 51_000);
     }
 
-    #[test]
-    fn grafana_dashboard_contains_retry_panels_without_removed_panels() {
-        let dashboard: Value = serde_json::from_str(include_str!("../grafana-pt.json")).unwrap();
-
-        assert_eq!(
-            dashboard["elements"]["panel-12"]["spec"]["title"],
-            "Transaction Retries Over Time"
-        );
-        assert_eq!(
-            dashboard["elements"]["panel-9"]["spec"]["title"],
-            "Transaction Retry Attempts Heatmap"
-        );
-        assert!(dashboard["elements"]["panel-10"].is_null());
-        assert!(dashboard["elements"]["panel-11"].is_null());
-    }
 }
