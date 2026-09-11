@@ -500,7 +500,7 @@ async fn read_successful_send_transaction_response(
 fn serialized_transaction_bytes(
     transaction: &Transaction,
 ) -> Result<Vec<u8>, SendTransactionRequestError> {
-    bincode::serialize(transaction).map_err(|error| {
+    wincode::serialize(transaction).map_err(|error| {
         SendTransactionRequestError::TransactionSerializationFailed {
             reason: error.to_string(),
         }

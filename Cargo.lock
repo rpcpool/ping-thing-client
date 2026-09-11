@@ -2616,7 +2616,6 @@ version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
- "bincode",
  "bs58",
  "dotenvy",
  "env_logger",
@@ -2645,6 +2644,7 @@ dependencies = [
  "tokio",
  "tonic",
  "warp",
+ "wincode",
  "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
 ]
