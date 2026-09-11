@@ -2629,7 +2629,6 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-client",
- "solana-compute-budget-interface",
  "solana-hash 4.5.0",
  "solana-instruction",
  "solana-keypair",

@@ -5,21 +5,14 @@ use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use dotenv::dotenv;
 use log::{debug, error, info, warn};
+use rand::RngExt;
 use reqwest::Client;
-use rand::{RngExt};
 use serde_json::{json, Value};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
-use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_hash::Hash;
-use solana_instruction::Instruction;
 use solana_keypair::Keypair;
-use solana_message::Message;
-use solana_pubkey::Pubkey;
 use solana_signer::Signer;
-use solana_system_interface::instruction as system_instruction;
-use solana_transaction::Transaction;
 use solana_transaction_status::UiTransactionEncoding;
-use spl_memo_interface::{instruction as memo_instruction, v3 as memo_program};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +29,7 @@ use utils::{
         send_and_confirm, ActiveTransaction, RetryReason, SendAndConfirmOutcome,
         TransactionSignatureBytes,
     },
+    v1_transaction::{self, PreparedTransaction},
 };
 
 const USE_MEMO_IX_WITH_STRING_ENV_VAR: &str = "USE_MEMO_IX_WITH_STRING";
@@ -54,32 +48,8 @@ fn memo_string_from_environment() -> Result<Option<String>> {
     }
 }
 
-fn build_transaction_instructions(
-    wallet_pubkey: &Pubkey,
-    current_priority_fee: u64,
-    cu_budget: u32,
-    memo_string: Option<&str>,
-    lamports_to_transfer: u64,
-) -> Vec<Instruction> {
-    let mut instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(cu_budget),
-        ComputeBudgetInstruction::set_compute_unit_price(current_priority_fee),
-        system_instruction::transfer(wallet_pubkey, wallet_pubkey, lamports_to_transfer),
-    ];
-
-    if let Some(memo_string) = memo_string {
-        instructions.push(memo_instruction::build_memo(
-            &memo_program::id(),
-            memo_string.as_bytes(),
-            &[wallet_pubkey],
-        ));
-    }
-
-    instructions
-}
-
-fn generate_random_number_in_range(ranges: &Vec<f32>) -> f32 {
-    rand::rng().random_range(*ranges.get(0).unwrap()..=*ranges.get(1).unwrap())
+fn generate_random_number_in_range(ranges: &[f32]) -> f32 {
+    rand::rng().random_range(*ranges.first().unwrap()..=*ranges.get(1).unwrap())
 }
 
 #[derive(Debug, Clone)]
@@ -101,8 +71,18 @@ enum SendTransactionEndpointKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TritonSendTxEncoding {
     Raw,
-    Base58,
     Base64,
+}
+
+fn parse_send_encoding(value: &str) -> Result<TritonSendTxEncoding> {
+    match value.to_lowercase().as_str() {
+        "raw" => Ok(TritonSendTxEncoding::Raw),
+        "base64" => Ok(TritonSendTxEncoding::Base64),
+        "base58" => {
+            anyhow::bail!("SEND_TX_ENCODING=base58 is unsupported for v1; use raw or base64")
+        }
+        other => anyhow::bail!("invalid SEND_TX_ENCODING: {other}"),
+    }
 }
 
 #[derive(Debug)]
@@ -262,16 +242,9 @@ fn configured_send_transaction_endpoint_from_environment(
         other => anyhow::bail!("invalid SEND_TX_KIND: {}", other),
     };
 
-    let encoding = match std::env::var("SEND_TX_ENCODING")
-        .unwrap_or_else(|_| "raw".to_string())
-        .to_lowercase()
-        .as_str()
-    {
-        "raw" => TritonSendTxEncoding::Raw,
-        "base58" => TritonSendTxEncoding::Base58,
-        "base64" => TritonSendTxEncoding::Base64,
-        other => anyhow::bail!("invalid SEND_TX_ENCODING: {}", other),
-    };
+    let encoding = parse_send_encoding(
+        &std::env::var("SEND_TX_ENCODING").unwrap_or_else(|_| "raw".to_string()),
+    )?;
 
     let max_retries = std::env::var("SEND_TX_MAX_RETRIES")
         .ok()
@@ -315,7 +288,7 @@ async fn send_transaction_using_configured_send_transaction_endpoint_or_rpc_clie
     send_transaction_endpoint: Option<&ConfiguredSendTransactionEndpoint>,
     send_transaction_http_client: &Client,
     rpc_client: &RpcClient,
-    transaction: &Transaction,
+    transaction: &PreparedTransaction,
     send_transaction_config: RpcSendTransactionConfig,
 ) -> Result<(), SendTransactionRequestError> {
     match send_transaction_endpoint {
@@ -343,7 +316,7 @@ async fn send_transaction_using_configured_send_transaction_endpoint_or_rpc_clie
         }
         Some(_) => unreachable!("all send transaction endpoint kinds are handled"),
         None => rpc_client
-            .send_transaction_with_config(transaction, send_transaction_config)
+            .send_transaction_with_config(&transaction.transaction, send_transaction_config)
             .await
             .map(|_| ())
             .map_err(|rpc_client_send_transaction_error| {
@@ -357,15 +330,13 @@ async fn send_transaction_using_configured_send_transaction_endpoint_or_rpc_clie
 async fn send_transaction_using_json_rpc_endpoint(
     send_transaction_endpoint: &ConfiguredSendTransactionEndpoint,
     send_transaction_http_client: &Client,
-    transaction: &Transaction,
+    transaction: &PreparedTransaction,
     send_transaction_config: RpcSendTransactionConfig,
 ) -> Result<(), SendTransactionRequestError> {
     let serialized_transaction_base64 =
         BASE64_STANDARD.encode(serialized_transaction_bytes(transaction)?);
     let mut adjusted_send_transaction_config = send_transaction_config;
-    if adjusted_send_transaction_config.encoding.is_none() {
-        adjusted_send_transaction_config.encoding = Some(UiTransactionEncoding::Base64);
-    }
+    adjusted_send_transaction_config.encoding = Some(UiTransactionEncoding::Base64);
     let request_body = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -401,9 +372,9 @@ async fn send_transaction_using_json_rpc_endpoint(
 async fn send_transaction_using_triton_sendtx_endpoint(
     send_transaction_endpoint: &ConfiguredSendTransactionEndpoint,
     send_transaction_http_client: &Client,
-    transaction: &Transaction,
+    transaction: &PreparedTransaction,
 ) -> Result<(), SendTransactionRequestError> {
-    let expected_signature = transaction.signatures[0].to_string();
+    let expected_signature = transaction.transaction.signatures[0].to_string();
     let serialized_transaction_bytes = serialized_transaction_bytes(transaction)?;
     let mut request = send_transaction_http_client.post(&send_transaction_endpoint.endpoint);
 
@@ -427,11 +398,7 @@ async fn send_transaction_using_triton_sendtx_endpoint(
     let request = match send_transaction_endpoint.encoding {
         TritonSendTxEncoding::Raw => request
             .header("Content-Type", "application/octet-stream")
-            .body(serialized_transaction_bytes),
-        TritonSendTxEncoding::Base58 => request
-            .query(&[("encoding", "base58")])
-            .header("Content-Type", "text/plain")
-            .body(bs58::encode(serialized_transaction_bytes).into_string()),
+            .body(serialized_transaction_bytes.to_vec()),
         TritonSendTxEncoding::Base64 => request
             .query(&[("encoding", "base64")])
             .header("Content-Type", "text/plain")
@@ -498,13 +465,16 @@ async fn read_successful_send_transaction_response(
 }
 
 fn serialized_transaction_bytes(
-    transaction: &Transaction,
-) -> Result<Vec<u8>, SendTransactionRequestError> {
-    wincode::serialize(transaction).map_err(|error| {
-        SendTransactionRequestError::TransactionSerializationFailed {
-            reason: error.to_string(),
-        }
-    })
+    transaction: &PreparedTransaction,
+) -> Result<&[u8], SendTransactionRequestError> {
+    if transaction.bytes.len() > v1_transaction::MAX_TRANSACTION_BYTES {
+        return Err(
+            SendTransactionRequestError::TransactionSerializationFailed {
+                reason: "transaction exceeds 4096 bytes".to_string(),
+            },
+        );
+    }
+    Ok(&transaction.bytes)
 }
 
 fn signature_from_json_rpc_response(
@@ -595,10 +565,10 @@ fn signature_from_sendtx_response(
 
 fn validate_response_signature(
     endpoint: &str,
-    transaction: &Transaction,
+    transaction: &PreparedTransaction,
     response_signature: &str,
 ) -> Result<(), SendTransactionRequestError> {
-    let expected_signature = transaction.signatures[0].to_string();
+    let expected_signature = transaction.transaction.signatures[0].to_string();
     if response_signature != expected_signature {
         return Err(
             SendTransactionRequestError::SendTransactionResponseSignatureMismatch {
@@ -782,6 +752,57 @@ fn log_send_transaction_error(
     }
 }
 
+async fn setup_resource_limits(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    memo: Option<&str>,
+    compute_override: Option<u32>,
+    account_override: Option<u32>,
+    watcher_failure_rx: &mut mpsc::UnboundedReceiver<String>,
+) -> Result<v1_transaction::ResourceLimits> {
+    tokio::select! {
+        result = v1_transaction::estimate_limits(rpc, payer, memo, compute_override, account_override) => result,
+        Some(watcher) = watcher_failure_rx.recv() => anyhow::bail!("{watcher} watcher stopped"),
+    }
+}
+
+async fn initialize_priority_fee(
+    enabled: bool,
+    priority_fee_rx: &mut watch::Receiver<Option<PriorityFeeSnapshot>>,
+    watcher_failure_rx: &mut mpsc::UnboundedReceiver<String>,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    info!("[Priority Fees] Waiting for the first RPC value");
+    let first_priority_fee = tokio::select! {
+        result = wait_for_priority_fee(priority_fee_rx) => result?,
+        Some(watcher) = watcher_failure_rx.recv() => anyhow::bail!("{watcher} watcher stopped"),
+    };
+    info!(
+        "[Priority Fees] Initial value cached: priority_fee_micro_lamports={:?}",
+        first_priority_fee.value
+    );
+    Ok(())
+}
+
+fn describe_send_endpoint(
+    configured: Option<&ConfiguredSendTransactionEndpoint>,
+    rpc_endpoint: &str,
+) -> (&'static str, String) {
+    let Some(endpoint) = configured else {
+        info!("SEND_TX_ENDPOINT: [NOT SET]");
+        return ("rpc_client", rpc_endpoint.to_string());
+    };
+    info!("SEND_TX_ENDPOINT: {:?}", endpoint.endpoint);
+    info!("SEND_TX_KIND: {:?}", endpoint.kind);
+    let kind = match endpoint.kind {
+        SendTransactionEndpointKind::JsonRpc => "json_rpc",
+        SendTransactionEndpointKind::TritonSendTx => "sendtx",
+    };
+    (kind, endpoint.endpoint.clone())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     info!("=== Starting Ping Thing Client ===");
@@ -795,25 +816,8 @@ async fn main() -> Result<()> {
 
     let configured_send_transaction_endpoint =
         configured_send_transaction_endpoint_from_environment()?;
-    if let Some(send_transaction_endpoint_value) = &configured_send_transaction_endpoint {
-        info!(
-            "SEND_TX_ENDPOINT: {:?}",
-            send_transaction_endpoint_value.endpoint
-        );
-        info!("SEND_TX_KIND: {:?}", send_transaction_endpoint_value.kind);
-    } else {
-        info!("SEND_TX_ENDPOINT: [NOT SET]");
-    }
-    let resolved_transaction_send_endpoint = configured_send_transaction_endpoint
-        .as_ref()
-        .map(|e| e.endpoint.clone())
-        .unwrap_or_else(|| rpc_endpoint.clone());
-    let transaction_send_kind = match configured_send_transaction_endpoint.as_ref() {
-        Some(endpoint) if endpoint.kind == SendTransactionEndpointKind::JsonRpc => "json_rpc",
-        Some(endpoint) if endpoint.kind == SendTransactionEndpointKind::TritonSendTx => "sendtx",
-        Some(_) => unreachable!("all send transaction endpoint kinds are handled"),
-        None => "rpc_client",
-    };
+    let (transaction_send_kind, resolved_transaction_send_endpoint) =
+        describe_send_endpoint(configured_send_transaction_endpoint.as_ref(), &rpc_endpoint);
     info!(
         "TRANSACTION_SEND_ENDPOINT: {:?}",
         resolved_transaction_send_endpoint
@@ -915,11 +919,12 @@ async fn main() -> Result<()> {
         info!("{}: [NOT SET]", USE_MEMO_IX_WITH_STRING_ENV_VAR);
     }
 
-    let cu_budget = std::env::var("CU_BUDGET")
-        .unwrap_or_else(|_| "500".to_string())
-        .parse::<u32>()
-        .unwrap_or(500);
-    info!("CU_BUDGET: {:?}", cu_budget);
+    let cu_override =
+        v1_transaction::limit_from_environment("CU_BUDGET", v1_transaction::MAX_COMPUTE_UNITS)?;
+    let account_override = v1_transaction::limit_from_environment(
+        "LOADED_ACCOUNTS_DATA_SIZE_LIMIT",
+        v1_transaction::MAX_ACCOUNT_BYTES,
+    )?;
 
     let priority_fee_percentile = std::env::var("PRIORITY_FEE_PERCENTILE")
         .unwrap_or_else(|_| "5000".to_string())
@@ -932,9 +937,7 @@ async fn main() -> Result<()> {
         .parse::<String>()
         .unwrap_or("1.0,2.0".to_string())
         .split(",")
-        .map(|v| {
-            v.trim().parse::<f32>().expect("invalid f32")
-        })
+        .map(|v| v.trim().parse::<f32>().expect("invalid f32"))
         .collect();
     info!("LAMPORTS_MULTIPLIERS: {:?}", lamports_multipliers);
 
@@ -1131,20 +1134,23 @@ async fn main() -> Result<()> {
     set_watcher_up(metrics.as_ref(), &pinger_name, "slot", true);
     set_watcher_up(metrics.as_ref(), &pinger_name, "transaction", true);
 
-    if use_priority_fee {
-        info!("[Priority Fees] Waiting for the first RPC value");
-        let first_priority_fee = tokio::select! {
-            result = wait_for_priority_fee(&mut priority_fee_rx) => result?,
-            Some(watcher) = watcher_failure_rx.recv() => {
-                anyhow::bail!("{watcher} watcher stopped");
-            }
-        };
-        info!(
-            "[Priority Fees] Initial value cached: priority_fee_micro_lamports={:?}",
-            first_priority_fee.value
-        );
-    }
+    initialize_priority_fee(
+        use_priority_fee,
+        &mut priority_fee_rx,
+        &mut watcher_failure_rx,
+    )
+    .await?;
 
+    let resource_limits = setup_resource_limits(
+        &rpc_client,
+        &wallet_keypair,
+        memo_string.as_deref(),
+        cu_override,
+        account_override,
+        &mut watcher_failure_rx,
+    )
+    .await?;
+    info!("V1 resource limits validated: {:?}", resource_limits);
     info!("=== Entering main transaction loop ===");
 
     let tx_window_duration = Duration::from_secs(60);
@@ -1233,25 +1239,32 @@ async fn main() -> Result<()> {
             slot_sent, blockhash, current_priority_fee
         );
 
-        let lamports_to_transfer = (5000 as f32 * generate_random_number_in_range(&lamports_multipliers)).floor() as u64;
+        let lamports_to_transfer =
+            (5000_f32 * generate_random_number_in_range(&lamports_multipliers)).floor() as u64;
 
-        // Build transaction instructions
-        let instructions = build_transaction_instructions(
-            &wallet_keypair.pubkey(),
+        let total_priority_fee = v1_transaction::priority_fee_lamports(
             current_priority_fee,
-            cu_budget,
+            resource_limits.compute_units,
+        )?;
+        let tx = v1_transaction::build(
+            &wallet_keypair,
+            blockhash,
+            lamports_to_transfer,
             memo_string.as_deref(),
-            lamports_to_transfer
+            resource_limits,
+            total_priority_fee,
+        )?;
+        info!(
+            "[TX] version=1 bytes={} memo_bytes={} limits={:?} priority_fee_lamports={}",
+            tx.bytes.len(),
+            tx.memo_bytes,
+            resource_limits,
+            total_priority_fee
         );
-
-        // Create and sign transaction
-        let message =
-            Message::new_with_blockhash(&instructions, Some(&wallet_keypair.pubkey()), &blockhash);
-        let tx = Transaction::new(&[&wallet_keypair], message, blockhash);
         last_used_blockhash = Some(blockhash);
 
-        let signature = tx.signatures[0].to_string();
-        let signature_bytes: TransactionSignatureBytes = tx.signatures[0]
+        let signature = tx.transaction.signatures[0].to_string();
+        let signature_bytes: TransactionSignatureBytes = tx.transaction.signatures[0]
             .as_ref()
             .try_into()
             .context("transaction signature must be 64 bytes")?;
@@ -1297,6 +1310,7 @@ async fn main() -> Result<()> {
                             rpc_client,
                             tx,
                             RpcSendTransactionConfig {
+                                encoding: Some(UiTransactionEncoding::Base64),
                                 skip_preflight,
                                 max_retries: Some(0),
                                 ..Default::default()
@@ -1565,5 +1579,4 @@ mod tests {
 
         assert_eq!(task.await.unwrap().unwrap().value, 51_000);
     }
-
 }

@@ -23,7 +23,6 @@ reqwest = { version = "~0.12.28", default-features = false, features = ["rustls-
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 solana-client = "4.2.1"
-solana-compute-budget-interface = "~3.0.0"
 solana-hash = "~4.5.0"
 solana-instruction = "~3.4.0"
 solana-keypair = "3.1.2"
