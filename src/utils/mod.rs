@@ -5,3 +5,4 @@ pub mod priority_fees;
 pub mod slot;
 pub mod subscription_manager;
 pub mod transaction_manager;
+pub mod v1_transaction;

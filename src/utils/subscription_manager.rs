@@ -38,6 +38,7 @@ pub async fn watch_transactions(
             account_exclude: vec![],
             account_required: vec![wallet_pubkey.to_string()],
             token_accounts: None,
+            cuckoo_account_include: None,
         },
     );
 
